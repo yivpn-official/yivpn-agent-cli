@@ -1,36 +1,43 @@
 ---
 name: yivpn-agent-vpn
-description: Provision a zero-account, rootless encrypted VPN proxy (127.0.0.1:10808 HTTP + SOCKS5) in AI sandboxes, Docker containers, or cloud VMs using the YIVPN Agent VPN API (ed25519-v1 + Hosted Checkout / x402 Base USDC).
+description: Control a local YIVPN Desktop App via Model Context Protocol (127.0.0.1:38419/mcp) OR provision a zero-account, rootless encrypted VPN proxy (127.0.0.1:10808) in cloud VMs and Docker sandboxes using the YIVPN Agent VPN API + MCP Server.
 ---
 
-# YIVPN Agent VPN Skill
+# YIVPN Unified MCP & Agent VPN Skill
 
-Use this skill whenever an autonomous agent, cloud VM, unprivileged Docker container, or headless browser needs an encrypted multi-region (`US`, `JP`, `SG`, `HK`) network exit without registering an email account, installing a GUI desktop app, or risking SSH disconnection.
+Use this skill in two scenarios:
 
-## Core Principles
+1. **Desktop Workstation (Windows / macOS with YIVPN Desktop App installed)**:
+   Connect to the user's opt-in **Local MCP Server** (`http://127.0.0.1:38419/mcp` with `Authorization: Bearer yivpn_mcp_...`, or via `YIVPN_MCP_TOKEN=... npx --yes github:yivpn-official/yivpn-agent-cli mcp`) to inspect real VPN status, diagnose domain/IP routes, preview split-tunneling rules (`preview_routing_rules`), apply & verify live `sing-box` kernel reloads (`apply_routing_rules`), and roll back (`rollback_routing_rules`).
+2. **Headless Cloud VM / Docker Container / Autonomous Sandbox**:
+   Provision an encrypted multi-region (`US`, `JP`, `SG`, `HK`) `127.0.0.1:10808` proxy with zero email registration, zero GUI app, zero `root` privileges, and zero dropped SSH sessions (`npx --yes github:yivpn-official/yivpn-agent-cli mcp --headless` or CLI subcommands).
 
-1. **Identity = Local Ed25519 Keypair**: Generate a 32-byte Ed25519 key locally (`~/.yivpn-agent/key.json`, `0600`). Never transmit the private key.
-2. **Default to `mode=proxy` (`127.0.0.1:10808`)**: Unlike kernel WireGuard/TUN interfaces that require `CAP_NET_ADMIN` and overwrite the VM default route (severing SSH), `mode=proxy` exposes a local HTTP + SOCKS5 proxy on `127.0.0.1:10808` with zero `root` privileges.
-3. **Dual Payment Rails**:
-   - `checkout`: Generates a zero-account Stripe / Apple Pay / Alipay / WeChat Pay link (`$2.99` 1 mo, `$6.99` 3 mo, `$12.99` 6 mo, `$21.99` 12 mo). Present `checkout_url` to the human operator, then run `status --wait`.
-   - `x402`: HTTP `402 Payment Required` on Base (`eip155:8453`) USDC (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`) when `payment_rails.x402.available` is `true` in `discover`.
-
-## Quick Commands (Node.js 20+)
+## Desktop Local MCP Quickstart (`127.0.0.1:38419/mcp`)
 
 ```bash
-# 1. Generate local Ed25519 keypair
+# Claude Code HTTP
+claude mcp add --transport http yivpn http://127.0.0.1:38419/mcp --header "Authorization: Bearer yivpn_mcp_<TOKEN>"
+
+# Or Stdio Bridge via npx
+claude mcp add yivpn -e YIVPN_MCP_TOKEN=yivpn_mcp_<TOKEN> -- npx --yes github:yivpn-official/yivpn-agent-cli mcp
+```
+
+Workflow rules when calling Desktop Local MCP:
+- Always call `get_capabilities` and `get_vpn_status` first.
+- Always call `preview_routing_rules` before `apply_routing_rules` and inspect conflicts.
+- Use verified `service_preset` IDs (`openai`, `anthropic`, `github`, `google`, `telegram`, `xiaohongshu`, `baidu`, `wechat`, `amap`, `alibaba`, `bilibili`, `qichacha`) rather than guessing third-party CDN domains.
+- If a call returns `status: "requires_user_confirmation"`, ask the user to click **Approve** in the YIVPN Desktop App before retrying with `confirmationId`.
+
+## Headless Cloud / Sandbox Quickstart (`127.0.0.1:10808`)
+
+```bash
+# Register Headless MCP Server
+claude mcp add yivpn-cloud -- npx --yes github:yivpn-official/yivpn-agent-cli mcp --headless
+
+# Or one-shot CLI setup
 npx --yes github:yivpn-official/yivpn-agent-cli keygen
-
-# 2. Request a zero-account payment link (or x402 quote)
 npx --yes github:yivpn-official/yivpn-agent-cli buy --months 1 --rail checkout
-
-# 3. Wait until entitlement is active & upstream nodes are ready
 npx --yes github:yivpn-official/yivpn-agent-cli status --wait
-
-# 4. Optional: set tunnel DNS guardrails (malware, ads, adult, smart_split) & exit region
-npx --yes github:yivpn-official/yivpn-agent-cli settings --guardrails malware,ads --region US
-
-# 5. Write ready-to-run rootless sing-box config & launch on 127.0.0.1:10808
 npx --yes github:yivpn-official/yivpn-agent-cli config --mode proxy --region auto --out yivpn-agent.json
 sing-box run -c yivpn-agent.json &
 HTTPS_PROXY=http://127.0.0.1:10808 curl -fsSL https://api.ipify.org?format=json
@@ -38,6 +45,7 @@ HTTPS_PROXY=http://127.0.0.1:10808 curl -fsSL https://api.ipify.org?format=json
 
 ## References
 
-- Machine quickstart: `https://yivpn.net/vpn-api/llms.txt`
+- Desktop Local MCP instructions: `https://yivpn.net/vpn-mcp/llms.txt`
+- Headless Agent VPN API instructions: `https://yivpn.net/vpn-api/llms.txt`
 - OpenAPI 3.1 spec: `https://yivpn.net/vpn-api/openapi.yaml`
 - Live discovery endpoint: `https://yivpn.net/api/v1/vpn`

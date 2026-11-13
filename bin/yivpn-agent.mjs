@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
 
 const DEFAULT_BASE_URL = process.env.YIVPN_API_BASE || 'https://yivpn.net/api/v1/vpn';
 const DEFAULT_KEY_PATH = process.env.YIVPN_KEY_FILE || path.join(os.homedir(), '.yivpn-agent', 'key.json');
+const DEFAULT_DESKTOP_MCP_URL = process.env.YIVPN_MCP_URL || 'http://127.0.0.1:38419/mcp';
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 function parseArgs(argv) {
@@ -57,6 +60,15 @@ function loadKeyRecord(keyFile) {
     throw new Error(`Malformed key file at ${keyFile}.`);
   }
   return parsed;
+}
+
+function loadOrCreateKeyRecord(keyFile) {
+  if (fs.existsSync(keyFile)) {
+    return { record: loadKeyRecord(keyFile), created: false };
+  }
+  const record = generateKeyRecord();
+  saveKeyRecord(keyFile, record);
+  return { record, created: true };
 }
 
 function saveKeyRecord(keyFile, record) {
@@ -110,13 +122,424 @@ async function apiRequest({ baseUrl, method = 'GET', subPath = '', bodyObj = nul
   return { status: res.status, headers: res.headers, data };
 }
 
+// =============================================================================
+// MCP Server (Desktop Local MCP Bridge + Headless Cloud Ed25519 MCP Server)
+// =============================================================================
+
+export const HEADLESS_MCP_TOOLS = [
+  {
+    name: 'get_capabilities',
+    description:
+      'Return YIVPN Headless Agent VPN API capabilities, supported protocols (Hysteria2 + VLESS+REALITY), guardrail presets, payment rails, and local Ed25519 key status.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'get_vpn_status',
+    description:
+      'Inspect the signed Ed25519 VPN entitlement status (active, ready, expires_at, remaining_seconds, guardrails) and local keypair metadata.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'list_servers',
+    description:
+      'List authorized multi-region Hysteria2 and VLESS+REALITY exit nodes (US, JP, SG, HK) provisioned for this Ed25519 key.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'purchase_vpn_entitlement',
+    description:
+      'Mint a local Ed25519 keypair (if none exists) and request a zero-account VPN entitlement via Hosted Checkout (Stripe/Apple Pay/Alipay/WeChat) or x402 Base USDC.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        months: { type: 'integer', enum: [1, 3, 6, 12], description: 'Subscription duration in months (default: 1).' },
+        rail: { type: 'string', enum: ['checkout', 'x402'], description: 'Payment rail (default: checkout).' },
+        currency: { type: 'string', enum: ['usd', 'cny'], description: 'Currency for checkout rail (default: usd).' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'configure_vpn_guardrails',
+    description:
+      'Read or update tunnel DNS guardrails (malware, ads, adult, smart_split) and preferred exit region (auto, US, JP, SG, HK).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        guardrails: {
+          type: 'array',
+          items: { type: 'string', enum: ['malware', 'ads', 'adult', 'smart_split'] },
+          description: 'Active DNS/routing guardrails to enforce inside the tunnel.',
+        },
+        preferredRegion: {
+          type: 'string',
+          enum: ['auto', 'US', 'JP', 'SG', 'HK'],
+          description: 'Preferred exit region.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'export_singbox_config',
+    description:
+      'Fetch a ready-to-run rootless sing-box JSON configuration (default 127.0.0.1:10808 mixed HTTP/SOCKS5 proxy that never drops SSH) and optionally save it to outPath.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['proxy', 'tun'], description: 'proxy (rootless 127.0.0.1:port, default) or tun.' },
+        region: { type: 'string', enum: ['auto', 'US', 'JP', 'SG', 'HK'], description: 'Target exit region (default: auto).' },
+        port: { type: 'integer', description: 'Local mixed proxy port when mode=proxy (default: 10808).' },
+        outPath: { type: 'string', description: 'Optional file path to write the sing-box JSON configuration (mode 0600).' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'diagnose_connection',
+    description:
+      'Diagnose DNS A/AAAA records and direct HTTPS reachability/latency to a public domain or URL (blocks private/loopback targets).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Public domain or HTTPS URL (e.g. api.ipify.org or https://cloudflare.com/cdn-cgi/trace).' },
+      },
+      required: ['target'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'rotate_or_revoke_key',
+    description:
+      'Atomically rotate remaining subscription time to a brand-new local Ed25519 keypair, or immediately revoke the entitlement.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['rotate', 'revoke'], description: 'rotate or revoke.' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  },
+];
+
+function isPrivateOrLoopbackHost(host) {
+  const h = host.trim().toLowerCase();
+  if (
+    h === 'localhost' ||
+    h.endsWith('.local') ||
+    h.endsWith('.internal') ||
+    h === '127.0.0.1' ||
+    h === '::1' ||
+    h.startsWith('10.') ||
+    h.startsWith('192.168.') ||
+    h.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(h)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
+  if (name === 'get_capabilities') {
+    const disc = await apiRequest({ baseUrl, method: 'GET' });
+    const hasKey = fs.existsSync(keyFile);
+    const pubkey = hasKey ? loadKeyRecord(keyFile).pubkey : null;
+    return {
+      mode: 'headless-ed25519-api',
+      platform: os.platform(),
+      keyFile,
+      hasLocalKeypair: hasKey,
+      pubkey,
+      desktopMcpNote:
+        'Running in Headless Cloud/Container API mode. To control a local YIVPN Windows/macOS Desktop App instead, pass YIVPN_MCP_TOKEN=<yivpn_mcp_...> from YIVPN Settings -> Local MCP.',
+      serviceDiscovery: disc.data,
+    };
+  }
+
+  if (name === 'purchase_vpn_entitlement') {
+    const { record, created } = loadOrCreateKeyRecord(keyFile);
+    const months = Number(args.months || 1);
+    const rail = String(args.rail || 'checkout');
+    const currency = String(args.currency || 'usd');
+    const res = await apiRequest({
+      baseUrl,
+      method: 'POST',
+      subPath: '/entitlements',
+      bodyObj: { pubkey: record.pubkey, months, rail, payment_method: 'card', currency },
+    });
+    const out = typeof res.data === 'object' ? { statusCode: res.status, keyCreated: created, pubkey: record.pubkey, ...res.data } : { statusCode: res.status, body: res.data };
+    const payHeader = res.headers.get('payment-required');
+    if (payHeader) out.paymentRequiredHeader = payHeader;
+    return out;
+  }
+
+  if (name === 'diagnose_connection') {
+    const rawTarget = String(args.target || '').trim();
+    if (!rawTarget) throw new Error('MISSING_TARGET: target is required.');
+    const urlObj = rawTarget.includes('://') ? new URL(rawTarget) : new URL(`https://${rawTarget}`);
+    if (isPrivateOrLoopbackHost(urlObj.hostname)) {
+      throw new Error(`FORBIDDEN_TARGET: Refusing to probe private or loopback host "${urlObj.hostname}".`);
+    }
+    const [v4, v6] = await Promise.all([
+      dns.resolve4(urlObj.hostname).catch(() => []),
+      dns.resolve6(urlObj.hostname).catch(() => []),
+    ]);
+    const started = Date.now();
+    let directProbe;
+    try {
+      const resp = await fetch(urlObj.toString(), { signal: AbortSignal.timeout(5000) });
+      directProbe = { reachable: true, httpStatus: resp.status, latencyMs: Date.now() - started };
+    } catch (e) {
+      directProbe = { reachable: false, error: e?.message || String(e), latencyMs: Date.now() - started };
+    }
+    return {
+      target: rawTarget,
+      host: urlObj.hostname,
+      dns: { ipv4: v4, ipv6: v6 },
+      directProbe,
+    };
+  }
+
+  const keyRecord = loadKeyRecord(keyFile);
+
+  if (name === 'get_vpn_status') {
+    const res = await apiRequest({ baseUrl, method: 'GET', subPath: '/status', keyRecord });
+    if (res.status >= 400) throw new Error(JSON.stringify(res.data));
+    return res.data;
+  }
+
+  if (name === 'list_servers') {
+    const res = await apiRequest({ baseUrl, method: 'GET', subPath: '/locations', keyRecord });
+    if (res.status >= 400) throw new Error(JSON.stringify(res.data));
+    const safeLocations = Array.isArray(res.data?.locations)
+      ? res.data.locations.map((loc) => ({
+          id: loc.id,
+          name: loc.name,
+          region: loc.region,
+          protocols: loc.protocols,
+        }))
+      : res.data;
+    return { pubkey: keyRecord.pubkey, locations: safeLocations };
+  }
+
+  if (name === 'configure_vpn_guardrails') {
+    const hasUpdates = Array.isArray(args.guardrails) || typeof args.preferredRegion === 'string';
+    if (!hasUpdates) {
+      const res = await apiRequest({ baseUrl, method: 'GET', subPath: '/settings', keyRecord });
+      if (res.status >= 400) throw new Error(JSON.stringify(res.data));
+      return res.data;
+    }
+    const bodyObj = {};
+    if (Array.isArray(args.guardrails)) bodyObj.guardrails = args.guardrails;
+    if (typeof args.preferredRegion === 'string') bodyObj.preferred_region = args.preferredRegion;
+    const res = await apiRequest({ baseUrl, method: 'PUT', subPath: '/settings', bodyObj, keyRecord });
+    if (res.status >= 400) throw new Error(JSON.stringify(res.data));
+    return res.data;
+  }
+
+  if (name === 'export_singbox_config') {
+    const mode = String(args.mode || 'proxy');
+    const region = String(args.region || 'auto');
+    const port = Number(args.port || 10808);
+    const qs = new URLSearchParams({ format: 'singbox', mode, region, port: String(port), raw: '1' });
+    const res = await apiRequest({ baseUrl, method: 'GET', subPath: `/config?${qs.toString()}`, keyRecord });
+    if (res.status >= 400) throw new Error(typeof res.data === 'string' ? res.data : JSON.stringify(res.data));
+    const text = typeof res.data === 'string' ? res.data : JSON.stringify(res.data, null, 2) + '\n';
+    if (args.outPath) {
+      const outPath = path.resolve(String(args.outPath));
+      fs.writeFileSync(outPath, text, { encoding: 'utf8', mode: 0o600 });
+      return {
+        ok: true,
+        outFile: outPath,
+        mode,
+        region,
+        ...(mode === 'proxy' ? { httpProxy: `http://127.0.0.1:${port}`, socks5Proxy: `socks5://127.0.0.1:${port}` } : {}),
+        launchCommand: `sing-box run -c ${outPath}`,
+      };
+    }
+    return {
+      ok: true,
+      mode,
+      region,
+      ...(mode === 'proxy' ? { httpProxy: `http://127.0.0.1:${port}`, socks5Proxy: `socks5://127.0.0.1:${port}` } : {}),
+      singboxConfig: typeof res.data === 'string' ? JSON.parse(res.data) : res.data,
+    };
+  }
+
+  if (name === 'rotate_or_revoke_key') {
+    if (args.action === 'rotate') {
+      const nextRecord = generateKeyRecord();
+      const res = await apiRequest({
+        baseUrl,
+        method: 'POST',
+        subPath: '/rotate',
+        bodyObj: { new_pubkey: nextRecord.pubkey },
+        keyRecord,
+      });
+      if (res.status >= 400) throw new Error(JSON.stringify(res.data));
+      const backupPath = `${keyFile}.prev`;
+      fs.copyFileSync(keyFile, backupPath);
+      saveKeyRecord(keyFile, nextRecord);
+      return { ...res.data, keyFile, backupKeyFile: backupPath };
+    }
+    if (args.action === 'revoke') {
+      const res = await apiRequest({ baseUrl, method: 'DELETE', subPath: '/entitlements', keyRecord });
+      if (res.status >= 400) throw new Error(JSON.stringify(res.data));
+      return res.data;
+    }
+    throw new Error(`Unsupported action "${args.action}".`);
+  }
+
+  throw new Error(`UNKNOWN_TOOL: "${name}"`);
+}
+
+export async function handleHeadlessMcpJsonRpc(msg, ctx) {
+  if (!msg || typeof msg !== 'object') {
+    return { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } };
+  }
+  const { id, method, params } = msg;
+  if (id === undefined || id === null) {
+    return null;
+  }
+  if (method === 'initialize') {
+    const requestedVersion = params?.protocolVersion || '2024-11-05';
+    return {
+      jsonrpc: '2.0',
+      id,
+      result: {
+        protocolVersion: requestedVersion === '2025-03-26' ? '2025-03-26' : '2024-11-05',
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: 'yivpn-agent-mcp', version: '1.1.0' },
+      },
+    };
+  }
+  if (method === 'ping') {
+    return { jsonrpc: '2.0', id, result: {} };
+  }
+  if (method === 'tools/list') {
+    return { jsonrpc: '2.0', id, result: { tools: HEADLESS_MCP_TOOLS } };
+  }
+  if (method === 'resources/list') {
+    return { jsonrpc: '2.0', id, result: { resources: [] } };
+  }
+  if (method === 'prompts/list') {
+    return { jsonrpc: '2.0', id, result: { prompts: [] } };
+  }
+  if (method === 'tools/call') {
+    const toolName = params?.name;
+    const toolArgs = params?.arguments || {};
+    try {
+      const result = await executeHeadlessMcpTool(toolName, toolArgs, ctx);
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+          isError: false,
+        },
+      };
+    } catch (err) {
+      const errObj = { error: err?.message || String(err) };
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(errObj, null, 2) }],
+          structuredContent: errObj,
+          isError: true,
+        },
+      };
+    }
+  }
+  return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
+}
+
+async function runDesktopMcpStdioBridge(mcpUrl, mcpToken) {
+  const parsed = new URL(mcpUrl);
+  if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost') {
+    throw new Error(`Refusing non-loopback Desktop MCP endpoint: ${mcpUrl}`);
+  }
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  for await (const line of rl) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let msg;
+    try {
+      msg = JSON.parse(trimmed);
+    } catch {
+      process.stdout.write(
+        JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }) + '\n'
+      );
+      continue;
+    }
+    const isNotification = msg.id === undefined || msg.id === null;
+    try {
+      const resp = await fetch(mcpUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(mcpToken ? { Authorization: `Bearer ${mcpToken}` } : {}),
+        },
+        body: JSON.stringify(msg),
+      });
+      if (resp.status === 202 || isNotification) continue;
+      const text = await resp.text();
+      if (!text.trim()) continue;
+      const out = JSON.parse(text);
+      process.stdout.write(JSON.stringify(out) + '\n');
+    } catch (err) {
+      if (!isNotification) {
+        process.stdout.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id ?? null,
+            error: {
+              code: -32000,
+              message: `Cannot reach YIVPN Desktop Local MCP at ${mcpUrl} (${err?.message || err}). Ensure YIVPN Desktop App is open and Local MCP is enabled in Settings.`,
+            },
+          }) + '\n'
+        );
+      }
+    }
+  }
+}
+
+async function runHeadlessMcpStdioServer(ctx) {
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  for await (const line of rl) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let msg;
+    try {
+      msg = JSON.parse(trimmed);
+    } catch {
+      process.stdout.write(
+        JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }) + '\n'
+      );
+      continue;
+    }
+    const out = await handleHeadlessMcpJsonRpc(msg, ctx);
+    if (out) {
+      process.stdout.write(JSON.stringify(out) + '\n');
+    }
+  }
+}
+
 function printHelp() {
-  console.log(`yivpn-agent-cli v1.0.0 — Zero-Account VPN API CLI for AI Agents & Cloud Sandboxes
+  console.log(`yivpn-agent-cli v1.1.0 — Official YIVPN MCP Server & Zero-Account Agent VPN CLI
 
 Usage:
   yivpn-agent <command> [options]
 
 Commands:
+  mcp         Start Model Context Protocol (MCP) stdio server:
+                • Desktop Bridge Mode (when YIVPN_MCP_TOKEN / --mcp-token is set):
+                  Bridges stdio to YIVPN Desktop App Local MCP (127.0.0.1:38419/mcp) with live sing-box routing & rollback.
+                • Headless Cloud Mode (default in VMs/Docker without Desktop App):
+                  Exposes zero-account Ed25519 + x402/Checkout Agent VPN API tools over MCP.
   keygen      Generate a local Ed25519 keypair (~/.yivpn-agent/key.json)
   discover    Query unauthenticated service capabilities, terms & payment rails
   buy         Purchase/extend VPN time (--months 1|3|6|12 --rail checkout|x402)
@@ -126,9 +549,13 @@ Commands:
   config      Fetch ready-to-run rootless sing-box config (--mode proxy|tun --out file.json)
   rotate      Atomically migrate remaining time to a newly generated Ed25519 keypair
   revoke      Immediately revoke entitlement and disable upstream credentials
-  selftest    Verify local Ed25519 keygen and ed25519-v1 signature round-trip
+  selftest    Verify local Ed25519 signing and MCP JSON-RPC protocol round-trip
 
-Global Options:
+Options:
+  --mcp-url <url>     Desktop Local MCP URL (default: http://127.0.0.1:38419/mcp or $YIVPN_MCP_URL)
+  --mcp-token <tok>   Desktop Local MCP token ($YIVPN_MCP_TOKEN)
+  --headless          Force Headless Ed25519 API MCP mode even if YIVPN_MCP_TOKEN is set
+  --desktop           Force Desktop App MCP bridge mode
   --key-file <path>   Path to Ed25519 key JSON (default: ~/.yivpn-agent/key.json)
   --api-base <url>    API base URL (default: https://yivpn.net/api/v1/vpn)
 `);
@@ -144,6 +571,18 @@ async function run() {
   const baseUrl = String(flags['api-base'] || DEFAULT_BASE_URL);
   const keyFile = path.resolve(String(flags['key-file'] || DEFAULT_KEY_PATH));
 
+  if (command === 'mcp') {
+    const mcpUrl = String(flags['mcp-url'] || DEFAULT_DESKTOP_MCP_URL);
+    const mcpToken = flags['mcp-token'] ? String(flags['mcp-token']) : process.env.YIVPN_MCP_TOKEN || '';
+    const useDesktop = Boolean(flags.desktop || (!flags.headless && mcpToken));
+    if (useDesktop) {
+      await runDesktopMcpStdioBridge(mcpUrl, mcpToken);
+    } else {
+      await runHeadlessMcpStdioServer({ baseUrl, keyFile });
+    }
+    return;
+  }
+
   if (command === 'selftest') {
     const rec = generateKeyRecord();
     assert.match(rec.pubkey, /^[0-9a-f]{64}$/);
@@ -156,7 +595,31 @@ async function run() {
     });
     const ok = crypto.verify(null, Buffer.from(payload, 'utf8'), pubObj, Buffer.from(hdrs['X-YIVPN-Signature'], 'base64'));
     assert.equal(ok, true, 'ed25519-v1 self-test verification failed');
-    console.log(JSON.stringify({ ok: true, profile: 'ed25519-v1', pubkey_sample: rec.pubkey }, null, 2));
+
+    const initRes = await handleHeadlessMcpJsonRpc(
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } },
+      { baseUrl, keyFile }
+    );
+    assert.equal(initRes.result.serverInfo.name, 'yivpn-agent-mcp');
+    const toolsRes = await handleHeadlessMcpJsonRpc(
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+      { baseUrl, keyFile }
+    );
+    assert.equal(toolsRes.result.tools.length, 8);
+
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          version: '1.1.0',
+          profile: 'ed25519-v1',
+          mcpTools: toolsRes.result.tools.length,
+          pubkey_sample: rec.pubkey,
+        },
+        null,
+        2
+      )
+    );
     return;
   }
 
@@ -180,11 +643,7 @@ async function run() {
   }
 
   if (command === 'buy') {
-    const keyRecord = fs.existsSync(keyFile) ? loadKeyRecord(keyFile) : (() => {
-      const r = generateKeyRecord();
-      saveKeyRecord(keyFile, r);
-      return r;
-    })();
+    const { record: keyRecord } = loadOrCreateKeyRecord(keyFile);
     const months = Number(flags.months || 1);
     const rail = String(flags.rail || 'checkout');
     const paymentMethod = String(flags.method || 'card');
