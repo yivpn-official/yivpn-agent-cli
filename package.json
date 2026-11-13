@@ -1,0 +1,33 @@
+{
+  "name": "yivpn-agent-cli",
+  "version": "1.0.0",
+  "description": "Zero-account, zero-dependency CLI & AI Agent Skill for the YIVPN Agent & Developer VPN API (ed25519-v1 + x402 + rootless sing-box proxy).",
+  "type": "module",
+  "bin": {
+    "yivpn-agent": "./bin/yivpn-agent.mjs"
+  },
+  "scripts": {
+    "test": "node ./bin/yivpn-agent.mjs selftest"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yivpn-official/yivpn-agent-cli.git"
+  },
+  "homepage": "https://yivpn.net/en/vpn-api/",
+  "keywords": [
+    "vpn",
+    "ai-agent",
+    "sing-box",
+    "ed25519",
+    "x402",
+    "hysteria2",
+    "vless",
+    "proxy",
+    "sandbox"
+  ],
+  "author": "YIVPN <support@yivpn.net>",
+  "license": "MIT"
+}
