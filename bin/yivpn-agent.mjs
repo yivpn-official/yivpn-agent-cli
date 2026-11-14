@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
@@ -122,6 +123,62 @@ async function apiRequest({ baseUrl, method = 'GET', subPath = '', bodyObj = nul
   return { status: res.status, headers: res.headers, data };
 }
 
+export function computeDeviceHash() {
+  try {
+    let raw = '';
+    if (process.platform === 'win32') {
+      const out = execFileSync('reg.exe', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2500,
+      });
+      const m = out.match(/MachineGuid\s+REG_SZ\s+([^\r\n]+)/i);
+      if (m) raw = m[1].trim().toLowerCase();
+    } else if (process.platform === 'darwin') {
+      const out = execFileSync('ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2500,
+      });
+      const m = out.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/i);
+      if (m) raw = m[1].trim().toLowerCase();
+    } else {
+      for (const p of ['/etc/machine-id', '/var/lib/dbus/machine-id']) {
+        if (fs.existsSync(p)) {
+          raw = fs.readFileSync(p, 'utf8').trim().toLowerCase();
+          if (raw) break;
+        }
+      }
+    }
+    if (!raw) return '';
+    return crypto.createHash('sha256').update(`yivpn-agent-device-v1:${process.platform}:${raw}`, 'utf8').digest('hex');
+  } catch {
+    return '';
+  }
+}
+
+async function claimFreeTrial({ baseUrl, keyFile }) {
+  const { record, created } = loadOrCreateKeyRecord(keyFile);
+  const deviceHash = computeDeviceHash();
+  const res = await apiRequest({
+    baseUrl,
+    method: 'POST',
+    subPath: '/entitlements',
+    bodyObj: { pubkey: record.pubkey, rail: 'trial' },
+    keyRecord: record,
+    extraHeaders: deviceHash ? { 'X-YIVPN-Device-Hash': deviceHash } : {},
+  });
+  const payload =
+    typeof res.data === 'object' && res.data !== null
+      ? { status_code: res.status, key_created: created, key_file: keyFile, pubkey: record.pubkey, ...res.data }
+      : { status_code: res.status, key_created: created, key_file: keyFile, pubkey: record.pubkey, body: res.data };
+  if (res.status === 403 && payload.error === 'trial_datacenter_ip_not_eligible') {
+    payload.upgrade_hint =
+      'Cloud/VPS datacenter IPs are not eligible for the $0 residential trial. Run "npx --yes github:yivpn-official/yivpn-agent-cli buy --months 1 --rail checkout" ($2.99 / ¥19.90) to unlock cloud sandboxes and US/JP/SG/HK nodes.';
+  }
+  return { status: res.status, payload };
+}
+
 // =============================================================================
 // MCP Server (Desktop Local MCP Bridge + Headless Cloud Ed25519 MCP Server)
 // =============================================================================
@@ -142,7 +199,13 @@ export const HEADLESS_MCP_TOOLS = [
   {
     name: 'list_servers',
     description:
-      'List authorized multi-region Hysteria2 and VLESS+REALITY exit nodes (US, JP, SG, HK) provisioned for this Ed25519 key.',
+      'List authorized multi-region Hysteria2 and VLESS exit nodes provisioned for this Ed25519 key.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'claim_free_trial',
+    description:
+      'Mint a local Ed25519 keypair (if none exists) and claim an instant $0 90-minute / 1 GiB free trial on US-Ohio (residential/office/mobile ISPs, 1 claim per 24h, zero credit card).',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -256,6 +319,14 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
         'Running in Headless Cloud/Container API mode. To control a local YIVPN Windows/macOS Desktop App instead, pass YIVPN_MCP_TOKEN=<yivpn_mcp_...> from YIVPN Settings -> Local MCP.',
       serviceDiscovery: disc.data,
     };
+  }
+
+  if (name === 'claim_free_trial') {
+    const { status, payload } = await claimFreeTrial({ baseUrl, keyFile });
+    if (status >= 400) {
+      throw new Error(JSON.stringify(payload));
+    }
+    return payload;
   }
 
   if (name === 'purchase_vpn_entitlement') {
@@ -411,7 +482,7 @@ export async function handleHeadlessMcpJsonRpc(msg, ctx) {
       result: {
         protocolVersion: requestedVersion === '2025-03-26' ? '2025-03-26' : '2024-11-05',
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'yivpn-agent-mcp', version: '1.1.0' },
+        serverInfo: { name: 'yivpn-agent-mcp', version: '1.2.0' },
       },
     };
   }
@@ -529,7 +600,7 @@ async function runHeadlessMcpStdioServer(ctx) {
 }
 
 function printHelp() {
-  console.log(`yivpn-agent-cli v1.1.0 — Official YIVPN MCP Server & Zero-Account Agent VPN CLI
+  console.log(`yivpn-agent-cli v1.2.0 — Official YIVPN MCP Server & Zero-Account Agent VPN CLI
 
 Usage:
   yivpn-agent <command> [options]
@@ -539,10 +610,11 @@ Commands:
                 • Desktop Bridge Mode (when YIVPN_MCP_TOKEN / --mcp-token is set):
                   Bridges stdio to YIVPN Desktop App Local MCP (127.0.0.1:38419/mcp) with live sing-box routing & rollback.
                 • Headless Cloud Mode (default in VMs/Docker without Desktop App):
-                  Exposes zero-account Ed25519 + x402/Checkout Agent VPN API tools over MCP.
+                  Exposes zero-account Ed25519 + $0 Trial / Checkout / x402 Agent VPN API tools over MCP.
+  trial       Claim an instant $0 90-minute / 1 GiB free trial on US-Ohio (mints keypair automatically; residential/local ISPs)
   keygen      Generate a local Ed25519 keypair (~/.yivpn-agent/key.json)
   discover    Query unauthenticated service capabilities, terms & payment rails
-  buy         Purchase/extend VPN time (--months 1|3|6|12 --rail checkout|x402)
+  buy         Purchase/extend multi-region VPN time (--months 1|3|6|12 --rail checkout|x402)
   status      Inspect signed key status (--wait to poll until active=true)
   locations   List provisioned Hysteria2 & VLESS+REALITY exit nodes
   settings    Read or update DNS guardrails (--guardrails malware,ads --region US)
@@ -605,21 +677,33 @@ async function run() {
       { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
       { baseUrl, keyFile }
     );
-    assert.equal(toolsRes.result.tools.length, 8);
+    assert.equal(toolsRes.result.tools.length, 9);
+    const devHash = computeDeviceHash();
+    if (devHash) {
+      assert.match(devHash, /^[0-9a-f]{64}$/);
+    }
 
     console.log(
       JSON.stringify(
         {
           ok: true,
-          version: '1.1.0',
+          version: '1.2.0',
           profile: 'ed25519-v1',
           mcpTools: toolsRes.result.tools.length,
+          deviceHashAvailable: Boolean(devHash),
           pubkey_sample: rec.pubkey,
         },
         null,
         2
       )
     );
+    return;
+  }
+
+  if (command === 'trial') {
+    const { status, payload } = await claimFreeTrial({ baseUrl, keyFile });
+    console.log(JSON.stringify(payload, null, 2));
+    if (status >= 400) process.exitCode = 1;
     return;
   }
 

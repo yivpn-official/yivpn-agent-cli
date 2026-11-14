@@ -1,7 +1,7 @@
 {
   "name": "yivpn-agent-cli",
-  "version": "1.1.0",
-  "description": "Zero-dependency CLI, MCP Server (Desktop Bridge + Headless Cloud API), and AI Agent Skill for YIVPN (Model Context Protocol + ed25519-v1 + x402 + sing-box).",
+  "version": "1.2.0",
+  "description": "Zero-dependency CLI, MCP Server (Desktop Bridge + Headless Cloud API), and AI Agent Skill for YIVPN ($0 90m/1GiB Trial + ed25519-v1 + x402 + sing-box).",
   "type": "module",
   "bin": {
     "yivpn-agent": "./bin/yivpn-agent.mjs"

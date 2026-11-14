@@ -1,10 +1,10 @@
-# yivpn-agent-cli (v1.1.0 — Unified MCP Server & Agent VPN CLI)
+# yivpn-agent-cli (v1.2.0 — Unified MCP Server & Zero-Account Agent VPN CLI)
 
 Official zero-dependency **Model Context Protocol (MCP)** server/bridge, Node.js CLI, Python `ed25519-v1` reference signer, and AI Agent `SKILL.md` for **[YIVPN Local MCP](https://yivpn.net/en/vpn-mcp/)** & **[YIVPN Agent VPN API](https://yivpn.net/en/vpn-api/)**.
 
 Works seamlessly across **two environments**:
 1. **Desktop Local MCP Mode (Windows & macOS `YIVPN v1.0.4+`)**: Connect Claude Code, OpenAI Codex, or Cursor directly to your local YIVPN Desktop App (`http://127.0.0.1:38419/mcp` or via `npx --yes github:yivpn-official/yivpn-agent-cli mcp`) to inspect real VPN status, diagnose routes, preview split-tunneling rules, reload the live `sing-box` kernel, and roll back safely.
-2. **Headless Cloud / Container Mode (Linux VMs, Docker, Sandboxes)**: Zero email registration, zero GUI app, zero `root` privileges, and zero dropped SSH sessions — mint a local `ed25519-v1` keypair, activate via Hosted Checkout or `x402` Base USDC, and run either as an MCP server (`yivpn-agent mcp`) or CLI (`127.0.0.1:10808` HTTP + SOCKS5).
+2. **Zero-App / Headless Agent Mode (Local Dev Machines, Linux VMs, Docker, Sandboxes)**: Zero email registration, zero GUI app, zero `root` privileges, and zero dropped SSH sessions — claim an instant **`$0` 90-minute / 1 GiB Free Trial** (`trial` / `claim_free_trial` on residential/local ISPs) or unlock multi-region `US/JP/SG/HK` & cloud VMs via Hosted Checkout (`$2.99` / `¥19.90`) or `x402` Base USDC, and run a rootless `127.0.0.1:10808` (HTTP + SOCKS5) proxy.
 
 - **Desktop Local MCP Docs**: [`https://yivpn.net/en/vpn-mcp/`](https://yivpn.net/en/vpn-mcp/) ([简体中文](https://yivpn.net/vpn-mcp/)) · [`llms.txt`](https://yivpn.net/vpn-mcp/llms.txt)
 - **Headless Agent API Docs**: [`https://yivpn.net/en/vpn-api/`](https://yivpn.net/en/vpn-api/) ([简体中文](https://yivpn.net/vpn-api/)) · [`llms.txt`](https://yivpn.net/vpn-api/llms.txt) · [`openapi.yaml`](https://yivpn.net/vpn-api/openapi.yaml)
@@ -19,9 +19,9 @@ Works seamlessly across **two environments**:
 Read https://yivpn.net/vpn-mcp/llms.txt , connect to my local YIVPN MCP server, check my current VPN status, and diagnose my network routes.
 ```
 
-### B. Headless Cloud VM / Docker Sandbox (Zero-Account API + MCP)
+### B. Zero-App / Headless Sandbox (Free Trial + Zero-Account API + MCP)
 ```text
-Read https://yivpn.net/vpn-api/llms.txt and set up a rootless YIVPN proxy on 127.0.0.1:10808 (or register the yivpn-agent-cli MCP server) for this environment.
+Read https://yivpn.net/vpn-api/llms.txt and set up a rootless YIVPN proxy on 127.0.0.1:10808 (claim the free trial if eligible, or register the yivpn-agent-cli MCP server) for this environment.
 ```
 
 ---
@@ -50,31 +50,31 @@ http_headers = { "Authorization" = "Bearer yivpn_mcp_<YOUR_TOKEN>" }
 
 ---
 
-## Mode 2: Headless Cloud / Docker MCP & CLI Quickstart (Node.js 20+)
+## Mode 2: Zero-App / Headless Cloud MCP & CLI Quickstart (Node.js 20+)
 
-### Register as a Headless MCP Server
+### Register as a Headless MCP Server (`9` Tools Including `claim_free_trial`)
 ```bash
 claude mcp add yivpn-cloud -- npx --yes github:yivpn-official/yivpn-agent-cli mcp --headless
 ```
 
 ### Or Run Directly from the CLI
 ```bash
-# 1. Mint a local Ed25519 keypair (~/.yivpn-agent/key.json, chmod 600)
+# Option 1: Claim instant $0 90-minute / 1 GiB Free Trial on US-Ohio (residential/local ISPs, zero card)
+#           Automatically generates ~/.yivpn-agent/key.json if none exists.
+npx --yes github:yivpn-official/yivpn-agent-cli trial
+
+# Option 2: Multi-Region Cloud/VPS Access ($2.99 / ¥19.90 1mo — unlocks US, JP, SG, HK & datacenter IPs)
 npx --yes github:yivpn-official/yivpn-agent-cli keygen
-
-# 2. Purchase time bound directly to your Ed25519 public key ($2.99 / 1 mo)
 npx --yes github:yivpn-official/yivpn-agent-cli buy --months 1 --rail checkout
-
-# 3. Poll until payment settles & multi-region nodes are provisioned
 npx --yes github:yivpn-official/yivpn-agent-cli status --wait
 
-# 4. Optional: configure tunnel DNS guardrails & preferred exit region
+# Optional: configure tunnel DNS guardrails & preferred exit region
 npx --yes github:yivpn-official/yivpn-agent-cli settings --guardrails malware,ads --region auto
 
-# 5. Export ready-to-run rootless sing-box config (127.0.0.1:10808 HTTP + SOCKS5)
+# Export ready-to-run rootless sing-box config (127.0.0.1:10808 HTTP + SOCKS5)
 npx --yes github:yivpn-official/yivpn-agent-cli config --mode proxy --out yivpn-agent.json
 
-# 6. Start tunnel without root and without touching host SSH routes
+# Start tunnel without root and without touching host SSH routes
 sing-box run -c yivpn-agent.json &
 HTTPS_PROXY=http://127.0.0.1:10808 curl -fsSL https://api.ipify.org?format=json
 ```
@@ -83,7 +83,7 @@ HTTPS_PROXY=http://127.0.0.1:10808 curl -fsSL https://api.ipify.org?format=json
 
 ## `ed25519-v1` Signing Specification
 
-Every authenticated API request includes three headers:
+Every authenticated API request (including `rail: "trial"`) includes three headers:
 
 - `X-YIVPN-Pubkey`: 64-character hex (or Base64) raw 32-byte Ed25519 public key
 - `X-YIVPN-Timestamp`: Unix epoch seconds (`10` digits, within `±300s`)
