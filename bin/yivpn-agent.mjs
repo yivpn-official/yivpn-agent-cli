@@ -11,12 +11,20 @@ import readline from 'node:readline';
 import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
 
-export const CLI_VERSION = '2.0.0';
+export const CLI_VERSION = '2.1.0';
 const DEFAULT_BASE_URL = process.env.YIVPN_API_BASE || 'https://yivpn.net/api/v1/vpn';
 const DEFAULT_AGENT_DIR = process.env.YIVPN_AGENT_DIR || path.join(os.homedir(), '.yivpn-agent');
 const DEFAULT_KEY_PATH = process.env.YIVPN_KEY_FILE || path.join(DEFAULT_AGENT_DIR, 'key.json');
 const DESKTOP_DEFAULT_PORTS = [38410, 38419];
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+const WIN_INET_REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
+const WIN_PROXY_OVERRIDE =
+  'localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>';
+
+function readJsonTextStripBom(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+  return JSON.parse(raw);
+}
 
 function parseArgs(argv) {
   const positional = [];
@@ -29,7 +37,7 @@ function parseArgs(argv) {
         flags[token.slice(2, eq)] = token.slice(eq + 1);
       } else {
         const next = argv[i + 1];
-        if (next && !next.startsWith('--')) {
+        if (next && !next.startsWith('-')) {
           flags[token.slice(2)] = next;
           i += 1;
         } else {
@@ -38,6 +46,8 @@ function parseArgs(argv) {
       }
     } else if (token === '-h') {
       flags.help = true;
+    } else if (token === '-v') {
+      flags.version = true;
     } else {
       positional.push(token);
     }
@@ -60,10 +70,10 @@ function generateKeyRecord() {
 function loadKeyRecord(keyFile) {
   if (!fs.existsSync(keyFile)) {
     throw new Error(
-      `No Ed25519 key found at ${keyFile}. Run "yivpn-agent trial" (free 90m/1GiB), "yivpn-agent connect --auto-trial", or "yivpn-agent keygen" first.`
+      `No Ed25519 key found at ${keyFile}. Run "yivpn-agent connect --auto-trial", "yivpn-agent trial" (free 90m/1GiB), or "yivpn-agent keygen" first.`
     );
   }
-  const parsed = JSON.parse(fs.readFileSync(keyFile, 'utf8'));
+  const parsed = readJsonTextStripBom(keyFile);
   if (!parsed?.pubkey || !parsed?.private_key_pem) {
     throw new Error(`Malformed key file at ${keyFile}.`);
   }
@@ -179,11 +189,36 @@ async function claimFreeTrial({ baseUrl, keyFile }) {
     typeof res.data === 'object' && res.data !== null
       ? { status_code: res.status, key_created: created, key_file: keyFile, pubkey: record.pubkey, ...res.data }
       : { status_code: res.status, key_created: created, key_file: keyFile, pubkey: record.pubkey, body: res.data };
-  if (res.status === 403 && payload.error === 'trial_datacenter_ip_not_eligible') {
-    payload.upgrade_hint =
-      'Cloud/VPS datacenter IPs are not eligible for the $0 residential trial. Run "npx --yes github:yivpn-official/yivpn-agent-cli buy --months 1 --rail checkout" ($2.99 / ¥19.90) to unlock cloud sandboxes and US/JP/SG/HK nodes.';
-  }
   return { status: res.status, payload };
+}
+
+export function detectInstalledDesktopApp() {
+  const home = os.homedir();
+  const candidates = [];
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+    candidates.push(
+      path.join(localAppData, 'YIVPN', 'YIVPN.exe'),
+      path.join(localAppData, 'Programs', 'YIVPN', 'YIVPN.exe'),
+      path.join(programFiles, 'YIVPN', 'YIVPN.exe')
+    );
+  } else if (process.platform === 'darwin') {
+    candidates.push('/Applications/YIVPN.app');
+  }
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) {
+        return {
+          installed: true,
+          path: p,
+          freeDailyTunMinutes: 90,
+          note: 'YIVPN Desktop GUI is installed on this computer (includes built-in 90 min/day free global TUN without account registration).',
+        };
+      }
+    } catch {}
+  }
+  return { installed: false, path: null };
 }
 
 // =============================================================================
@@ -247,7 +282,7 @@ export async function detectDesktopMcpEnvironment(explicitUrl = '') {
     const cfgPath = path.join(dir, 'mcp-config.json');
     if (fs.existsSync(cfgPath)) {
       try {
-        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+        const cfg = readJsonTextStripBom(cfgPath);
         if (typeof cfg?.port === 'number' && cfg.port > 0 && cfg.port < 65536) {
           configuredPort = cfg.port;
         }
@@ -298,17 +333,27 @@ function getDaemonStatePaths(keyFile) {
   };
 }
 
+function parseSingboxMajorMinor(binPath) {
+  try {
+    const out = execFileSync(binPath, ['version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2500,
+    });
+    const m = out.match(/sing-box version\s+(\d+)\.(\d+)/i);
+    if (m) {
+      return { major: Number(m[1]), minor: Number(m[2]), raw: m[0] };
+    }
+  } catch {}
+  return null;
+}
+
 export function resolveSingboxBinary(explicitBin = '') {
   const candidates = [];
   if (explicitBin) candidates.push(explicitBin);
   if (process.env.YIVPN_SINGBOX_BIN) candidates.push(process.env.YIVPN_SINGBOX_BIN);
 
   const exeName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
-  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
-  for (const d of pathDirs) {
-    candidates.push(path.join(d, exeName));
-  }
-
   const home = os.homedir();
   candidates.push(path.join(DEFAULT_AGENT_DIR, 'bin', exeName));
 
@@ -334,16 +379,239 @@ export function resolveSingboxBinary(explicitBin = '') {
     candidates.push('/usr/local/bin/sing-box', '/usr/bin/sing-box', path.join(home, '.local', 'bin', 'sing-box'));
   }
 
+  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const d of pathDirs) {
+    candidates.push(path.join(d, exeName));
+  }
+
+  const seen = new Set();
+  let fallbackBin = null;
   for (const c of candidates) {
+    if (!c) continue;
+    const normKey = process.platform === 'win32' ? path.resolve(c).toLowerCase() : path.resolve(c);
+    if (seen.has(normKey)) continue;
+    seen.add(normKey);
     try {
-      if (c && fs.existsSync(c) && fs.statSync(c).isFile()) {
-        return c;
+      if (fs.existsSync(c) && fs.statSync(c).isFile()) {
+        if (!fallbackBin) fallbackBin = c;
+        const ver = parseSingboxMajorMinor(c);
+        if (ver && (ver.major > 1 || (ver.major === 1 && ver.minor >= 12))) {
+          return c;
+        }
       }
     } catch {
       // ignore inaccessible path
     }
   }
-  return null;
+  return fallbackBin;
+}
+
+// =============================================================================
+// Optional Safe Workstation System Proxy (Windows WinINET / macOS networksetup)
+// =============================================================================
+
+export function readOsSystemProxyState() {
+  if (process.platform === 'win32') {
+    try {
+      const out = execFileSync('reg.exe', ['query', WIN_INET_REG_KEY], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2500,
+      });
+      const enableMatch = out.match(/ProxyEnable\s+REG_DWORD\s+0x([0-9a-f]+)/i);
+      const serverMatch = out.match(/ProxyServer\s+REG_SZ\s+([^\r\n]*)/i);
+      const overrideMatch = out.match(/ProxyOverride\s+REG_SZ\s+([^\r\n]*)/i);
+      return {
+        supported: true,
+        platform: 'win32',
+        enabled: enableMatch ? parseInt(enableMatch[1], 16) !== 0 : false,
+        server: serverMatch ? serverMatch[1].trim() : '',
+        override: overrideMatch ? overrideMatch[1].trim() : '',
+      };
+    } catch {
+      return { supported: false, platform: 'win32' };
+    }
+  }
+  if (process.platform === 'darwin') {
+    try {
+      const servicesOut = execFileSync('networksetup', ['-listallnetworkservices'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2500,
+      });
+      const services = servicesOut
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter((s) => s && !s.startsWith('*') && !s.toLowerCase().includes('asterisk'));
+      const preferred = services.find((s) => /^wi-?fi$/i.test(s)) || services[0];
+      if (!preferred) return { supported: false, platform: 'darwin' };
+      const webOut = execFileSync('networksetup', ['-getwebproxy', preferred], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2500,
+      });
+      const enabled = /^Enabled:\s*Yes/im.test(webOut);
+      const srv = (webOut.match(/^Server:\s*(.*)$/im)?.[1] || '').trim();
+      const prt = (webOut.match(/^Port:\s*(.*)$/im)?.[1] || '').trim();
+      return {
+        supported: true,
+        platform: 'darwin',
+        service: preferred,
+        enabled,
+        server: srv && prt && prt !== '0' ? `${srv}:${prt}` : '',
+      };
+    } catch {
+      return { supported: false, platform: 'darwin' };
+    }
+  }
+  return { supported: false, platform: process.platform };
+}
+
+function notifyWindowsWinInetRefresh() {
+  if (process.platform !== 'win32') return;
+  try {
+    const psCode =
+      '$sig=\'[DllImport("wininet.dll",SetLastError=true)]public static extern bool InternetSetOption(IntPtr h,int o,IntPtr b,int l);\';' +
+      '$t=Add-Type -MemberDefinition $sig -Name W -Namespace YivpnWinInet -PassThru;' +
+      '[void]$t::InternetSetOption([IntPtr]::Zero,39,[IntPtr]::Zero,0);' +
+      '[void]$t::InternetSetOption([IntPtr]::Zero,37,[IntPtr]::Zero,0)';
+    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCode], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 3500,
+      windowsHide: true,
+    });
+  } catch {
+    // Registry write already succeeded; apps polling registry still pick up ProxyEnable
+  }
+}
+
+export function enableOsSystemProxy(port) {
+  const proxyHostPort = `127.0.0.1:${port}`;
+  if (process.platform === 'win32') {
+    const prev = readOsSystemProxyState();
+    execFileSync('reg.exe', ['add', WIN_INET_REG_KEY, '/v', 'ProxyServer', '/t', 'REG_SZ', '/d', proxyHostPort, '/f'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 2500,
+    });
+    execFileSync(
+      'reg.exe',
+      ['add', WIN_INET_REG_KEY, '/v', 'ProxyOverride', '/t', 'REG_SZ', '/d', WIN_PROXY_OVERRIDE, '/f'],
+      { stdio: ['ignore', 'ignore', 'ignore'], timeout: 2500 }
+    );
+    execFileSync('reg.exe', ['add', WIN_INET_REG_KEY, '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '1', '/f'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 2500,
+    });
+    notifyWindowsWinInetRefresh();
+    return {
+      applied: true,
+      platform: 'win32',
+      proxyServer: proxyHostPort,
+      previous: prev,
+    };
+  }
+  if (process.platform === 'darwin') {
+    const prev = readOsSystemProxyState();
+    if (!prev.supported || !prev.service) {
+      return { applied: false, platform: 'darwin', reason: 'Could not detect active macOS network service.' };
+    }
+    const svc = prev.service;
+    execFileSync('networksetup', ['-setwebproxy', svc, '127.0.0.1', String(port)], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 2500,
+    });
+    execFileSync('networksetup', ['-setsecurewebproxy', svc, '127.0.0.1', String(port)], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 2500,
+    });
+    execFileSync('networksetup', ['-setsocksfirewallproxy', svc, '127.0.0.1', String(port)], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 2500,
+    });
+    execFileSync('networksetup', ['-setwebproxystate', svc, 'on'], { stdio: ['ignore', 'ignore', 'ignore'], timeout: 2500 });
+    execFileSync('networksetup', ['-setsecurewebproxystate', svc, 'on'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 2500,
+    });
+    execFileSync('networksetup', ['-setsocksfirewallproxystate', svc, 'on'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 2500,
+    });
+    return {
+      applied: true,
+      platform: 'darwin',
+      service: svc,
+      proxyServer: proxyHostPort,
+      previous: prev,
+    };
+  }
+  return {
+    applied: false,
+    platform: process.platform,
+    reason: 'System-wide proxy is skipped on Linux/SSH hosts to protect remote sessions; use HTTP_PROXY/HTTPS_PROXY.',
+  };
+}
+
+export function restoreOsSystemProxy(savedSystemProxy = null, managedPort = 10808) {
+  const managedTarget = `127.0.0.1:${managedPort}`;
+  if (process.platform === 'win32') {
+    try {
+      const cur = readOsSystemProxyState();
+      const pointingToUs = cur.enabled && (cur.server === managedTarget || cur.server.includes(`=${managedTarget}`));
+      if (!savedSystemProxy?.applied && !pointingToUs) {
+        return { restored: false, platform: 'win32', enabled: cur.enabled };
+      }
+      const prev = savedSystemProxy?.previous;
+      const shouldReEnablePrev = Boolean(prev?.enabled && prev.server && prev.server !== managedTarget);
+      if (shouldReEnablePrev) {
+        execFileSync(
+          'reg.exe',
+          ['add', WIN_INET_REG_KEY, '/v', 'ProxyServer', '/t', 'REG_SZ', '/d', prev.server, '/f'],
+          { stdio: ['ignore', 'ignore', 'ignore'], timeout: 2500 }
+        );
+        execFileSync('reg.exe', ['add', WIN_INET_REG_KEY, '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '1', '/f'], {
+          stdio: ['ignore', 'ignore', 'ignore'],
+          timeout: 2500,
+        });
+      } else {
+        execFileSync('reg.exe', ['add', WIN_INET_REG_KEY, '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '0', '/f'], {
+          stdio: ['ignore', 'ignore', 'ignore'],
+          timeout: 2500,
+        });
+      }
+      notifyWindowsWinInetRefresh();
+      return { restored: true, platform: 'win32', enabled: shouldReEnablePrev };
+    } catch {
+      return { restored: false, platform: 'win32' };
+    }
+  }
+  if (process.platform === 'darwin') {
+    try {
+      const cur = readOsSystemProxyState();
+      const svc = savedSystemProxy?.service || cur.service;
+      if (!svc) return { restored: false, platform: 'darwin' };
+      const pointingToUs = cur.enabled && cur.server === managedTarget;
+      if (!savedSystemProxy?.applied && !pointingToUs) {
+        return { restored: false, platform: 'darwin', enabled: cur.enabled };
+      }
+      execFileSync('networksetup', ['-setwebproxystate', svc, 'off'], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+        timeout: 2500,
+      });
+      execFileSync('networksetup', ['-setsecurewebproxystate', svc, 'off'], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+        timeout: 2500,
+      });
+      execFileSync('networksetup', ['-setsocksfirewallproxystate', svc, 'off'], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+        timeout: 2500,
+      });
+      return { restored: true, platform: 'darwin', service: svc, enabled: false };
+    } catch {
+      return { restored: false, platform: 'darwin' };
+    }
+  }
+  return { restored: false, platform: process.platform };
 }
 
 function isPidAlive(pid) {
@@ -381,21 +649,24 @@ function isVerifiedSingboxProcess(pid) {
 export async function inspectLocalProxyDaemon(keyFile) {
   const { daemonFile, logFile } = getDaemonStatePaths(keyFile);
   if (!fs.existsSync(daemonFile)) {
-    return { running: false };
+    return { running: false, osSystemProxy: readOsSystemProxyState() };
   }
   try {
-    const info = JSON.parse(fs.readFileSync(daemonFile, 'utf8'));
+    const info = readJsonTextStripBom(daemonFile);
     const pid = Number(info?.pid || 0);
     const port = Number(info?.port || 10808);
     const procAlive = isVerifiedSingboxProcess(pid);
     const portOpen = procAlive ? await probeLoopbackPort(port, 300) : false;
     if (!procAlive) {
+      if (info?.systemProxy?.applied) {
+        restoreOsSystemProxy(info.systemProxy, port);
+      }
       try {
         fs.unlinkSync(daemonFile);
       } catch {
         // ignore
       }
-      return { running: false };
+      return { running: false, osSystemProxy: readOsSystemProxyState() };
     }
     return {
       running: true,
@@ -405,28 +676,32 @@ export async function inspectLocalProxyDaemon(keyFile) {
       region: info.region || 'auto',
       httpProxy: `http://127.0.0.1:${port}`,
       socks5Proxy: `socks5://127.0.0.1:${port}`,
+      systemProxyEnabled: Boolean(info?.systemProxy?.applied),
+      osSystemProxy: readOsSystemProxyState(),
       startedAt: info.startedAt || null,
       singboxBin: info.singboxBin || null,
       logFile,
     };
   } catch {
-    return { running: false };
+    return { running: false, osSystemProxy: readOsSystemProxyState() };
   }
 }
 
-export async function stopLocalProxyDaemon(keyFile) {
+export async function stopLocalProxyDaemon(keyFile, fallbackPort = 10808) {
   const { daemonFile } = getDaemonStatePaths(keyFile);
   if (!fs.existsSync(daemonFile)) {
-    return { ok: true, wasRunning: false, disconnected: true };
+    const sysProxyRestore = restoreOsSystemProxy(null, fallbackPort);
+    return { ok: true, wasRunning: false, disconnected: true, systemProxy: sysProxyRestore };
   }
   let info = null;
   try {
-    info = JSON.parse(fs.readFileSync(daemonFile, 'utf8'));
+    info = readJsonTextStripBom(daemonFile);
   } catch {
     // ignore
   }
   const pid = Number(info?.pid || 0);
-  const port = Number(info?.port || 10808);
+  const port = Number(info?.port || fallbackPort || 10808);
+  const sysProxyRestore = restoreOsSystemProxy(info?.systemProxy || null, port);
   let terminated = false;
 
   if (isVerifiedSingboxProcess(pid)) {
@@ -462,6 +737,7 @@ export async function stopLocalProxyDaemon(keyFile) {
     disconnected: !portStillOpen,
     stoppedPid: terminated ? pid : null,
     port,
+    systemProxy: sysProxyRestore,
   };
 }
 
@@ -590,12 +866,13 @@ async function startLocalProxyDaemon({
   region = 'auto',
   port = 10808,
   autoTrial = false,
+  systemProxy = false,
   singboxBin = '',
 }) {
   const resolvedBin = resolveSingboxBinary(singboxBin);
   if (!resolvedBin) {
     throw new Error(
-      'SINGBOX_NOT_FOUND: Could not find "sing-box" in PATH or YIVPN_SINGBOX_BIN. Install sing-box (e.g. "brew install sing-box", "apt install sing-box", or winget/GitHub release) or use export_singbox_config.'
+      'SINGBOX_NOT_FOUND: Could not find "sing-box" (v1.12+) in PATH, YIVPN_SINGBOX_BIN, or YIVPN Desktop bundle. Install via "winget install SagerNet.sing-box" (Windows), "brew install sing-box" (macOS), "apt install sing-box" (Linux), or install YIVPN Desktop from https://yivpn.net/download/ (bundles sing-box 1.14).'
     );
   }
 
@@ -636,20 +913,26 @@ async function startLocalProxyDaemon({
     throw new Error(typeof cfgRes.data === 'string' ? cfgRes.data : JSON.stringify(cfgRes.data));
   }
 
-  await stopLocalProxyDaemon(keyFile);
+  await stopLocalProxyDaemon(keyFile, port);
 
   const { dir, daemonFile, configFile, logFile } = getDaemonStatePaths(keyFile);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const cfgText = typeof cfgRes.data === 'string' ? cfgRes.data : JSON.stringify(cfgRes.data, null, 2) + '\n';
   fs.writeFileSync(configFile, cfgText, { encoding: 'utf8', mode: 0o600 });
 
-  execFileSync(resolvedBin, ['check', '-c', configFile], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 5000,
-  });
+  try {
+    execFileSync(resolvedBin, ['check', '-c', configFile], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+    });
+  } catch (checkErr) {
+    const stderrStr = String(checkErr?.stderr || checkErr?.message || checkErr).trim();
+    throw new Error(`SINGBOX_CONFIG_CHECK_FAILED (${resolvedBin}): ${stderrStr}`);
+  }
 
-  const logFd = fs.openSync(logFile, 'a', 0o600);
+  // Truncate per-run log so error diagnostics only reflect the current launch
+  const logFd = fs.openSync(logFile, 'w', 0o600);
   const child = spawn(resolvedBin, ['run', '-c', configFile], {
     detached: true,
     stdio: ['ignore', logFd, logFd],
@@ -658,7 +941,7 @@ async function startLocalProxyDaemon({
   child.unref();
   fs.closeSync(logFd);
 
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + 8000;
   let ready = false;
   while (Date.now() < deadline) {
     if (!isPidAlive(child.pid)) {
@@ -672,15 +955,34 @@ async function startLocalProxyDaemon({
   }
 
   if (!ready) {
-    let logTail = '';
+    let fullLog = '';
     try {
-      logTail = fs.readFileSync(logFile, 'utf8').slice(-800);
+      fullLog = fs.readFileSync(logFile, 'utf8').trim();
     } catch {}
+    const fatalLines = fullLog
+      .split(/\r?\n/)
+      .filter((l) => /fatal|error|panic/i.test(l))
+      .slice(-6)
+      .join(' | ');
+    const diag = fatalLines || fullLog.slice(-1200);
     try {
       if (isPidAlive(child.pid)) process.kill(child.pid, 'SIGTERM');
     } catch {}
-    throw new Error(`DAEMON_START_FAILED: sing-box did not bind 127.0.0.1:${port}. Log tail: ${logTail}`);
+    throw new Error(`DAEMON_START_FAILED: sing-box did not bind 127.0.0.1:${port}. Diagnostics: ${diag}`);
   }
+
+  const systemProxyResult = systemProxy
+    ? enableOsSystemProxy(port)
+    : {
+        applied: false,
+        platform: process.platform,
+        hint:
+          process.platform === 'win32' || process.platform === 'darwin'
+            ? 'Local port 127.0.0.1:' +
+              port +
+              ' is active. Pass --system-proxy (or systemProxy=true) if the user wants Chrome/Edge/Safari/desktop apps to route through YIVPN automatically.'
+            : 'Local port 127.0.0.1:' + port + ' is active (SSH-safe; host routes untouched).',
+      };
 
   const startedAt = new Date().toISOString();
   const stateObj = {
@@ -691,25 +993,29 @@ async function startLocalProxyDaemon({
     configFile,
     logFile,
     startedAt,
+    systemProxy: systemProxyResult,
   };
   fs.writeFileSync(daemonFile, JSON.stringify(stateObj, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
 
   const exitProbe = await probeHttpsViaHttpProxy({
     proxyPort: port,
     targetUrl: 'https://api.ipify.org?format=json',
-    timeoutMs: 6500,
+    timeoutMs: 7500,
   });
 
   return {
     ok: true,
     connected: true,
-    mode: 'rootless-proxy',
+    mode: systemProxyResult.applied ? 'rootless-proxy+system-proxy' : 'rootless-proxy',
     pid: child.pid,
     region: String(region || 'auto'),
     port,
     httpProxy: `http://127.0.0.1:${port}`,
     socks5Proxy: `socks5://127.0.0.1:${port}`,
+    systemProxy: systemProxyResult,
+    desktopApp: detectInstalledDesktopApp(),
     envHint: `HTTPS_PROXY=http://127.0.0.1:${port} HTTP_PROXY=http://127.0.0.1:${port} ALL_PROXY=socks5://127.0.0.1:${port}`,
+    fastDownloadHint: `For large downloads (e.g. .msi/.dmg/.apk), pass --proxy http://127.0.0.1:${port} to curl.`,
     exitIp: exitProbe.data?.ip || null,
     exitProbe,
     ...(trialClaimed ? { trialClaimed } : {}),
@@ -742,7 +1048,7 @@ export const HEADLESS_MCP_TOOLS = [
   {
     name: 'connect_vpn',
     description:
-      'Start or switch the rootless local sing-box VPN proxy daemon (default 127.0.0.1:10808 mixed HTTP+SOCKS5 — zero root required, never drops SSH). Automatically claims the $0 90m/1GiB free trial if no active key exists and autoClaimTrial is true.',
+      'Start or switch the rootless local sing-box VPN proxy daemon (default 127.0.0.1:10808 mixed HTTP+SOCKS5 — zero root required, never drops Linux SSH). Automatically claims the $0 90m/1GiB free trial if no active key exists and autoClaimTrial is true. Set systemProxy=true ONLY on personal Windows/macOS workstations when the user wants browsers/desktop apps routed through YIVPN.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -759,6 +1065,10 @@ export const HEADLESS_MCP_TOOLS = [
           type: 'boolean',
           description: 'Automatically mint a keypair and claim the $0 90m/1GiB free trial if no active entitlement exists (default: true).',
         },
+        systemProxy: {
+          type: 'boolean',
+          description: 'On personal Windows/macOS desktops, configure OS system proxy to 127.0.0.1:port so Chrome/Edge/Safari use YIVPN (automatically restored on disconnect_vpn). Ignored on Linux/SSH.',
+        },
       },
       additionalProperties: false,
     },
@@ -766,7 +1076,7 @@ export const HEADLESS_MCP_TOOLS = [
   {
     name: 'disconnect_vpn',
     description:
-      'Cleanly stop the managed local rootless sing-box VPN proxy daemon without touching host routes or SSH sessions.',
+      'Cleanly stop the managed local rootless sing-box VPN proxy daemon and automatically restore OS system proxy if it was enabled by YIVPN.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -893,6 +1203,7 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
       pubkey,
       singboxAvailable: Boolean(singboxBin),
       singboxBin,
+      desktopAppInstalled: detectInstalledDesktopApp(),
       localProxy,
       desktopMcpDetected: {
         listening: desktopProbe.listening,
@@ -911,10 +1222,11 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
       return {
         connected: localProxy.running,
         localProxy,
+        desktopAppInstalled: detectInstalledDesktopApp(),
         hasLocalKeypair: false,
         entitlement: null,
         nextStepHint:
-          'Call connect_vpn (auto-claims the $0 90m/1GiB free trial on eligible local/residential ISPs and starts 127.0.0.1:10808) or purchase_vpn_entitlement on cloud VMs.',
+          'Call connect_vpn (auto-claims the $0 90m/1GiB free trial and starts 127.0.0.1:10808; pass systemProxy=true on personal Windows/macOS desktops if browsers should also use YIVPN).',
       };
     }
     const keyRecord = loadKeyRecord(keyFile);
@@ -923,6 +1235,7 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
     return {
       connected: localProxy.running,
       localProxy,
+      desktopAppInstalled: detectInstalledDesktopApp(),
       hasLocalKeypair: true,
       ...res.data,
     };
@@ -932,7 +1245,8 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
     const region = String(args.region || 'auto');
     const port = Number(args.port || 10808);
     const autoTrial = args.autoClaimTrial !== undefined ? Boolean(args.autoClaimTrial) : true;
-    return await startLocalProxyDaemon({ baseUrl, keyFile, region, port, autoTrial });
+    const systemProxy = Boolean(args.systemProxy);
+    return await startLocalProxyDaemon({ baseUrl, keyFile, region, port, autoTrial, systemProxy });
   }
 
   if (name === 'disconnect_vpn') {
@@ -1240,19 +1554,20 @@ Commands:
                   Auto-discovers YIVPN Desktop App Local MCP port (mcp-config.json / 38410 / 38419) for live sing-box routing & rollback.
                 • Zero-App Cloud + Rootless Daemon Mode (auto-selected in VMs, Docker & keyless setups):
                   Exposes 11 MCP tools including connect_vpn, disconnect_vpn, claim_free_trial ($0 90m/1GiB), guardrails & x402/Checkout.
-  connect     Start or switch the managed rootless sing-box proxy on 127.0.0.1:10808 (--region auto|US|JP|SG|HK --auto-trial)
-  disconnect  Stop the managed rootless sing-box proxy daemon cleanly
-  trial       Claim an instant $0 90-minute / 1 GiB free trial on US-Ohio (mints keypair automatically; residential/local ISPs)
+  connect     Start or switch the managed rootless sing-box proxy on 127.0.0.1:10808 (--auto-trial [--system-proxy])
+  disconnect  Stop the managed rootless sing-box proxy daemon and restore OS system proxy if enabled
+  trial       Claim an instant $0 90-minute / 1 GiB free trial on US-Ohio (works directly or behind proxies/cloud IPs)
   keygen      Generate a local Ed25519 keypair (~/.yivpn-agent/key.json)
   discover    Query unauthenticated service capabilities, terms & payment rails
-  buy         Purchase/extend multi-region VPN time (--months 1|3|6|12 --rail checkout|x402)
+  buy         Purchase/extend multi-region VPN time (--months 1|3|6|12 --rail checkout|x402 --currency usd|cny)
   status      Inspect live local proxy daemon + signed Ed25519 entitlement status (--wait to poll until active=true)
   locations   List provisioned Hysteria2 & VLESS+REALITY exit nodes
-  settings    Read or update DNS guardrails (--guardrails malware,ads --region US)
-  config      Export raw sing-box config (--mode proxy|tun --out file.json)
+  settings    Read or update DNS guardrails (--guardrails malware,ads,smart_split --region US)
+  config      Export raw sing-box 1.12+ / 1.14+ config (--mode proxy|tun --out file.json)
   rotate      Atomically migrate remaining time to a newly generated Ed25519 keypair
   revoke      Stop local daemon and immediately revoke entitlement
-  selftest    Verify Ed25519 signing, environment auto-detection, proxy probe, and MCP JSON-RPC round-trip
+  version     Print CLI version JSON
+  selftest    Verify Ed25519 signing, BOM tolerance, environment auto-detection, and MCP JSON-RPC round-trip
 
 Options:
   --mcp-url <url>       Desktop Local MCP URL ($YIVPN_MCP_URL; auto-discovers 38410 / 38419 when omitted)
@@ -1262,14 +1577,21 @@ Options:
   --region <code>       Target region for connect / config / settings (auto|US|JP|SG|HK)
   --port <num>          Local proxy port for connect / config (default: 10808)
   --auto-trial          Auto-claim $0 90m/1GiB free trial during "connect" if no active key exists
+  --system-proxy        Configure Windows/macOS OS system proxy to 127.0.0.1:<port> (auto-restored on disconnect)
   --singbox-bin <path>  Explicit path to sing-box binary ($YIVPN_SINGBOX_BIN)
   --key-file <path>     Path to Ed25519 key JSON (default: ~/.yivpn-agent/key.json)
   --api-base <url>      API base URL (default: https://yivpn.net/api/v1/vpn)
+  -v, --version         Print CLI version
+  -h, --help            Show this help message
 `);
 }
 
 async function run() {
   const { command, flags } = parseArgs(process.argv.slice(2));
+  if (flags.version || command === 'version') {
+    console.log(JSON.stringify({ ok: true, name: 'yivpn-agent-cli', version: CLI_VERSION }));
+    return;
+  }
   if (flags.help || command === 'help') {
     printHelp();
     return;
@@ -1304,7 +1626,14 @@ async function run() {
     const ok = crypto.verify(null, Buffer.from(payload, 'utf8'), pubObj, Buffer.from(hdrs['X-YIVPN-Signature'], 'base64'));
     assert.equal(ok, true, 'ed25519-v1 self-test verification failed');
 
-    const tmpKeyFile = path.join(os.tmpdir(), `yivpn-selftest-${process.pid}-${Date.now()}`, 'key.json');
+    const tmpDir = path.join(os.tmpdir(), `yivpn-selftest-${process.pid}-${Date.now()}`);
+    const tmpKeyFile = path.join(tmpDir, 'key.json');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    // Verify Windows PowerShell 5.1 UTF-8 BOM tolerance on JSON files
+    const bomFile = path.join(tmpDir, 'bom-test.json');
+    fs.writeFileSync(bomFile, '\uFEFF' + JSON.stringify({ hello: 'world' }), 'utf8');
+    assert.equal(readJsonTextStripBom(bomFile).hello, 'world', 'UTF-8 BOM stripping failed');
+    fs.rmSync(bomFile, { force: true });
     const initRes = await handleHeadlessMcpJsonRpc(
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } },
       { baseUrl, keyFile: tmpKeyFile }
@@ -1376,14 +1705,16 @@ async function run() {
     const region = String(flags.region || 'auto');
     const port = Number(flags.port || 10808);
     const autoTrial = Boolean(flags['auto-trial'] || flags.trial);
+    const systemProxy = Boolean(flags['system-proxy']);
     const singboxBin = flags['singbox-bin'] ? String(flags['singbox-bin']) : '';
-    const out = await startLocalProxyDaemon({ baseUrl, keyFile, region, port, autoTrial, singboxBin });
+    const out = await startLocalProxyDaemon({ baseUrl, keyFile, region, port, autoTrial, systemProxy, singboxBin });
     console.log(JSON.stringify(out, null, 2));
     return;
   }
 
   if (command === 'disconnect') {
-    const out = await stopLocalProxyDaemon(keyFile);
+    const port = Number(flags.port || 10808);
+    const out = await stopLocalProxyDaemon(keyFile, port);
     console.log(JSON.stringify(out, null, 2));
     return;
   }
@@ -1442,8 +1773,11 @@ async function run() {
 
   if (command === 'status') {
     const localProxy = await inspectLocalProxyDaemon(keyFile);
+    const desktopApp = detectInstalledDesktopApp();
     if (!fs.existsSync(keyFile)) {
-      console.log(JSON.stringify({ ok: true, has_local_keypair: false, local_proxy: localProxy }, null, 2));
+      console.log(
+        JSON.stringify({ ok: true, has_local_keypair: false, desktop_app: desktopApp, local_proxy: localProxy }, null, 2)
+      );
       return;
     }
     const keyRecord = loadKeyRecord(keyFile);
@@ -1455,8 +1789,8 @@ async function run() {
       if (!wait || (res.data?.active && res.data?.ready) || Date.now() >= deadline) {
         const merged =
           typeof res.data === 'object' && res.data !== null
-            ? { ...res.data, local_proxy: localProxy }
-            : { body: res.data, local_proxy: localProxy };
+            ? { ...res.data, desktop_app: desktopApp, local_proxy: localProxy }
+            : { body: res.data, desktop_app: desktopApp, local_proxy: localProxy };
         console.log(JSON.stringify(merged, null, 2));
         if (res.status >= 400) process.exitCode = 1;
         return;
@@ -1573,7 +1907,9 @@ async function run() {
 const isMainModule = (() => {
   try {
     if (!process.argv[1]) return false;
-    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+    const a = fs.realpathSync(process.argv[1]);
+    const b = fs.realpathSync(fileURLToPath(import.meta.url));
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
   } catch {
     return true;
   }
