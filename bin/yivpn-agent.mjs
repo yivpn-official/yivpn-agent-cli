@@ -1,16 +1,21 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import tls from 'node:tls';
+import { fileURLToPath } from 'node:url';
 
+export const CLI_VERSION = '2.0.0';
 const DEFAULT_BASE_URL = process.env.YIVPN_API_BASE || 'https://yivpn.net/api/v1/vpn';
-const DEFAULT_KEY_PATH = process.env.YIVPN_KEY_FILE || path.join(os.homedir(), '.yivpn-agent', 'key.json');
-const DEFAULT_DESKTOP_MCP_URL = process.env.YIVPN_MCP_URL || 'http://127.0.0.1:38419/mcp';
+const DEFAULT_AGENT_DIR = process.env.YIVPN_AGENT_DIR || path.join(os.homedir(), '.yivpn-agent');
+const DEFAULT_KEY_PATH = process.env.YIVPN_KEY_FILE || path.join(DEFAULT_AGENT_DIR, 'key.json');
+const DESKTOP_DEFAULT_PORTS = [38410, 38419];
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 function parseArgs(argv) {
@@ -54,7 +59,9 @@ function generateKeyRecord() {
 
 function loadKeyRecord(keyFile) {
   if (!fs.existsSync(keyFile)) {
-    throw new Error(`No Ed25519 key found at ${keyFile}. Run "yivpn-agent keygen" first.`);
+    throw new Error(
+      `No Ed25519 key found at ${keyFile}. Run "yivpn-agent trial" (free 90m/1GiB), "yivpn-agent connect --auto-trial", or "yivpn-agent keygen" first.`
+    );
   }
   const parsed = JSON.parse(fs.readFileSync(keyFile, 'utf8'));
   if (!parsed?.pubkey || !parsed?.private_key_pem) {
@@ -180,20 +187,550 @@ async function claimFreeTrial({ baseUrl, keyFile }) {
 }
 
 // =============================================================================
-// MCP Server (Desktop Local MCP Bridge + Headless Cloud Ed25519 MCP Server)
+// Desktop App Auto-Discovery & Loopback TCP Probing
+// =============================================================================
+
+export function probeLoopbackPort(port, timeoutMs = 250) {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ host: '127.0.0.1', port });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error', () => finish(false));
+  });
+}
+
+function getDesktopAppDataCandidates() {
+  const dirs = [];
+  if (process.env.YIVPN_APP_DATA_DIR) {
+    dirs.push(process.env.YIVPN_APP_DATA_DIR);
+  }
+  const home = os.homedir();
+  if (process.platform === 'win32') {
+    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+    dirs.push(path.join(appData, 'com.aicross.wawa.accelerator'));
+  } else if (process.platform === 'darwin') {
+    dirs.push(path.join(home, 'Library', 'Application Support', 'com.aicross.wawa.accelerator'));
+  } else {
+    const xdgData = process.env.XDG_DATA_HOME || path.join(home, '.local', 'share');
+    dirs.push(path.join(xdgData, 'com.aicross.wawa.accelerator'));
+  }
+  return dirs;
+}
+
+export async function detectDesktopMcpEnvironment(explicitUrl = '') {
+  if (explicitUrl) {
+    const parsed = new URL(explicitUrl);
+    const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+    const listening = (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+      ? await probeLoopbackPort(port)
+      : false;
+    return {
+      endpoint: explicitUrl,
+      port,
+      listening,
+      configuredEnabled: null,
+      source: 'explicit',
+    };
+  }
+
+  let configuredPort = null;
+  let configuredEnabled = null;
+  for (const dir of getDesktopAppDataCandidates()) {
+    const cfgPath = path.join(dir, 'mcp-config.json');
+    if (fs.existsSync(cfgPath)) {
+      try {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+        if (typeof cfg?.port === 'number' && cfg.port > 0 && cfg.port < 65536) {
+          configuredPort = cfg.port;
+        }
+        if (typeof cfg?.enabled === 'boolean') {
+          configuredEnabled = cfg.enabled;
+        }
+        break;
+      } catch {
+        // Ignore malformed local desktop config
+      }
+    }
+  }
+
+  const candidatePorts = [...new Set([configuredPort, ...DESKTOP_DEFAULT_PORTS].filter(Boolean))];
+  for (const p of candidatePorts) {
+    if (await probeLoopbackPort(p)) {
+      return {
+        endpoint: `http://127.0.0.1:${p}/mcp`,
+        port: p,
+        listening: true,
+        configuredEnabled,
+        source: p === configuredPort ? 'desktop-config' : 'port-probe',
+      };
+    }
+  }
+
+  const fallbackPort = configuredPort || DESKTOP_DEFAULT_PORTS[0];
+  return {
+    endpoint: `http://127.0.0.1:${fallbackPort}/mcp`,
+    port: fallbackPort,
+    listening: false,
+    configuredEnabled,
+    source: configuredPort ? 'desktop-config-offline' : 'default',
+  };
+}
+
+// =============================================================================
+// Built-in Rootless Local Proxy Daemon (sing-box 127.0.0.1:10808 lifecycle)
+// =============================================================================
+
+function getDaemonStatePaths(keyFile) {
+  const dir = path.dirname(keyFile);
+  return {
+    dir,
+    daemonFile: path.join(dir, 'daemon.json'),
+    configFile: path.join(dir, 'sing-box-proxy.json'),
+    logFile: path.join(dir, 'sing-box.log'),
+  };
+}
+
+export function resolveSingboxBinary(explicitBin = '') {
+  const candidates = [];
+  if (explicitBin) candidates.push(explicitBin);
+  if (process.env.YIVPN_SINGBOX_BIN) candidates.push(process.env.YIVPN_SINGBOX_BIN);
+
+  const exeName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const d of pathDirs) {
+    candidates.push(path.join(d, exeName));
+  }
+
+  const home = os.homedir();
+  candidates.push(path.join(DEFAULT_AGENT_DIR, 'bin', exeName));
+
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+    candidates.push(
+      path.join(localAppData, 'YIVPN', 'sing-box', 'sing-box.exe'),
+      path.join(localAppData, 'Programs', 'YIVPN', 'sing-box', 'sing-box.exe'),
+      path.join(programFiles, 'YIVPN', 'sing-box', 'sing-box.exe'),
+      path.join(localAppData, 'YIVPN', 'resources', 'sing-box', 'sing-box.exe'),
+      path.join(programFiles, 'YIVPN', 'resources', 'sing-box', 'sing-box.exe'),
+      path.join(home, 'Desktop', 'YIVPN', 'sing-box', 'sing-box.exe')
+    );
+  } else if (process.platform === 'darwin') {
+    candidates.push(
+      '/Applications/YIVPN.app/Contents/MacOS/sing-box',
+      '/Applications/YIVPN.app/Contents/Resources/sing-box/sing-box',
+      '/opt/homebrew/bin/sing-box',
+      '/usr/local/bin/sing-box'
+    );
+  } else {
+    candidates.push('/usr/local/bin/sing-box', '/usr/bin/sing-box', path.join(home, '.local', 'bin', 'sing-box'));
+  }
+
+  for (const c of candidates) {
+    try {
+      if (c && fs.existsSync(c) && fs.statSync(c).isFile()) {
+        return c;
+      }
+    } catch {
+      // ignore inaccessible path
+    }
+  }
+  return null;
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+function isVerifiedSingboxProcess(pid) {
+  if (!isPidAlive(pid)) return false;
+  try {
+    if (process.platform === 'win32') {
+      const out = execFileSync('tasklist.exe', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2500,
+      });
+      return out.toLowerCase().includes('sing-box');
+    }
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'comm='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2500,
+    });
+    return out.toLowerCase().includes('sing-box');
+  } catch {
+    return false;
+  }
+}
+
+export async function inspectLocalProxyDaemon(keyFile) {
+  const { daemonFile, logFile } = getDaemonStatePaths(keyFile);
+  if (!fs.existsSync(daemonFile)) {
+    return { running: false };
+  }
+  try {
+    const info = JSON.parse(fs.readFileSync(daemonFile, 'utf8'));
+    const pid = Number(info?.pid || 0);
+    const port = Number(info?.port || 10808);
+    const procAlive = isVerifiedSingboxProcess(pid);
+    const portOpen = procAlive ? await probeLoopbackPort(port, 300) : false;
+    if (!procAlive) {
+      try {
+        fs.unlinkSync(daemonFile);
+      } catch {
+        // ignore
+      }
+      return { running: false };
+    }
+    return {
+      running: true,
+      portReady: portOpen,
+      pid,
+      port,
+      region: info.region || 'auto',
+      httpProxy: `http://127.0.0.1:${port}`,
+      socks5Proxy: `socks5://127.0.0.1:${port}`,
+      startedAt: info.startedAt || null,
+      singboxBin: info.singboxBin || null,
+      logFile,
+    };
+  } catch {
+    return { running: false };
+  }
+}
+
+export async function stopLocalProxyDaemon(keyFile) {
+  const { daemonFile } = getDaemonStatePaths(keyFile);
+  if (!fs.existsSync(daemonFile)) {
+    return { ok: true, wasRunning: false, disconnected: true };
+  }
+  let info = null;
+  try {
+    info = JSON.parse(fs.readFileSync(daemonFile, 'utf8'));
+  } catch {
+    // ignore
+  }
+  const pid = Number(info?.pid || 0);
+  const port = Number(info?.port || 10808);
+  let terminated = false;
+
+  if (isVerifiedSingboxProcess(pid)) {
+    try {
+      if (process.platform === 'win32') {
+        execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+          stdio: ['ignore', 'ignore', 'ignore'],
+          timeout: 4000,
+        });
+      } else {
+        process.kill(pid, 'SIGTERM');
+      }
+      terminated = true;
+    } catch {
+      // ignore if exited concurrently
+    }
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && (isPidAlive(pid) || (await probeLoopbackPort(port, 120)))) {
+      await new Promise((r) => setTimeout(r, 80));
+    }
+  }
+
+  try {
+    if (fs.existsSync(daemonFile)) fs.unlinkSync(daemonFile);
+  } catch {
+    // ignore
+  }
+
+  const portStillOpen = await probeLoopbackPort(port, 200);
+  return {
+    ok: true,
+    wasRunning: terminated,
+    disconnected: !portStillOpen,
+    stoppedPid: terminated ? pid : null,
+    port,
+  };
+}
+
+export function probeHttpsViaHttpProxy({ proxyHost = '127.0.0.1', proxyPort, targetUrl, timeoutMs = 6500 }) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const parsed = new URL(targetUrl);
+    const targetHost = parsed.hostname;
+    const targetPort = Number(parsed.port || (parsed.protocol === 'http:' ? 80 : 443));
+    const reqPath = (parsed.pathname || '/') + (parsed.search || '');
+
+    let settled = false;
+    let rawSock = null;
+    let tlsSock = null;
+
+    const finish = (resObj) => {
+      if (settled) return;
+      settled = true;
+      try {
+        if (tlsSock) tlsSock.destroy();
+      } catch {}
+      try {
+        if (rawSock) rawSock.destroy();
+      } catch {}
+      resolve({ ...resObj, latencyMs: Date.now() - started });
+    };
+
+    const timer = setTimeout(() => {
+      finish({ reachable: false, error: `Proxy probe timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+
+    rawSock = net.createConnection({ host: proxyHost, port: proxyPort }, () => {
+      rawSock.write(
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nProxy-Connection: keep-alive\r\n\r\n`
+      );
+    });
+
+    rawSock.once('error', (err) => {
+      clearTimeout(timer);
+      finish({ reachable: false, error: err?.message || String(err) });
+    });
+
+    let connectBuf = Buffer.alloc(0);
+    const onConnectData = (chunk) => {
+      connectBuf = Buffer.concat([connectBuf, chunk]);
+      const headerEnd = connectBuf.indexOf('\r\n\r\n');
+      if (headerEnd < 0) {
+        if (connectBuf.length > 8192) {
+          clearTimeout(timer);
+          finish({ reachable: false, error: 'Oversized proxy CONNECT header' });
+        }
+        return;
+      }
+      rawSock.removeListener('data', onConnectData);
+      const statusLine = connectBuf.subarray(0, connectBuf.indexOf('\r\n')).toString('utf8');
+      if (!/^HTTP\/1\.[01]\s+200\b/i.test(statusLine)) {
+        clearTimeout(timer);
+        finish({ reachable: false, error: `Proxy CONNECT rejected: ${statusLine}` });
+        return;
+      }
+
+      if (parsed.protocol === 'http:') {
+        rawSock.write(
+          `GET ${reqPath} HTTP/1.1\r\nHost: ${targetHost}\r\nUser-Agent: yivpn-agent-cli/${CLI_VERSION}\r\nAccept: application/json,text/plain,*/*\r\nConnection: close\r\n\r\n`
+        );
+        collectHttpResponse(rawSock);
+        return;
+      }
+
+      tlsSock = tls.connect(
+        {
+          socket: rawSock,
+          servername: net.isIP(targetHost) ? undefined : targetHost,
+        },
+        () => {
+          tlsSock.write(
+            `GET ${reqPath} HTTP/1.1\r\nHost: ${targetHost}\r\nUser-Agent: yivpn-agent-cli/${CLI_VERSION}\r\nAccept: application/json,text/plain,*/*\r\nConnection: close\r\n\r\n`
+          );
+        }
+      );
+      tlsSock.once('error', (err) => {
+        clearTimeout(timer);
+        finish({ reachable: false, error: err?.message || String(err) });
+      });
+      collectHttpResponse(tlsSock);
+    };
+
+    function collectHttpResponse(stream) {
+      const chunks = [];
+      let total = 0;
+      stream.on('data', (c) => {
+        if (total < 16384) {
+          chunks.push(c);
+          total += c.length;
+        }
+      });
+      stream.once('end', () => {
+        clearTimeout(timer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        const splitIdx = raw.indexOf('\r\n\r\n');
+        const head = splitIdx >= 0 ? raw.slice(0, splitIdx) : raw;
+        const body = splitIdx >= 0 ? raw.slice(splitIdx + 4).trim() : '';
+        const statusMatch = head.match(/^HTTP\/1\.[01]\s+(\d{3})/i);
+        const httpStatus = statusMatch ? Number(statusMatch[1]) : null;
+        let parsedJson = null;
+        try {
+          parsedJson = JSON.parse(body);
+        } catch {
+          // non-JSON body is fine
+        }
+        finish({
+          reachable: Boolean(httpStatus),
+          httpStatus,
+          ...(parsedJson ? { data: parsedJson } : body ? { bodyPreview: body.slice(0, 240) } : {}),
+        });
+      });
+    }
+
+    rawSock.on('data', onConnectData);
+  });
+}
+
+async function startLocalProxyDaemon({
+  baseUrl,
+  keyFile,
+  region = 'auto',
+  port = 10808,
+  autoTrial = false,
+  singboxBin = '',
+}) {
+  const resolvedBin = resolveSingboxBinary(singboxBin);
+  if (!resolvedBin) {
+    throw new Error(
+      'SINGBOX_NOT_FOUND: Could not find "sing-box" in PATH or YIVPN_SINGBOX_BIN. Install sing-box (e.g. "brew install sing-box", "apt install sing-box", or winget/GitHub release) or use export_singbox_config.'
+    );
+  }
+
+  let trialClaimed = null;
+  if (!fs.existsSync(keyFile)) {
+    if (!autoTrial) {
+      throw new Error(
+        `NO_KEYPAIR: No Ed25519 key found at ${keyFile}. Pass autoClaimTrial=true / --auto-trial, run claim_free_trial, or purchase an entitlement first.`
+      );
+    }
+    const trialRes = await claimFreeTrial({ baseUrl, keyFile });
+    if (trialRes.status >= 400) {
+      throw new Error(`AUTO_TRIAL_FAILED: ${JSON.stringify(trialRes.payload)}`);
+    }
+    trialClaimed = trialRes.payload;
+  }
+
+  let keyRecord = loadKeyRecord(keyFile);
+  const qs = new URLSearchParams({
+    format: 'singbox',
+    mode: 'proxy',
+    region: String(region || 'auto'),
+    port: String(port),
+    raw: '1',
+  });
+  let cfgRes = await apiRequest({ baseUrl, method: 'GET', subPath: `/config?${qs.toString()}`, keyRecord });
+
+  if ((cfgRes.status === 402 || cfgRes.status === 403 || cfgRes.status === 404) && autoTrial && !trialClaimed) {
+    const trialRes = await claimFreeTrial({ baseUrl, keyFile });
+    if (trialRes.status < 400) {
+      trialClaimed = trialRes.payload;
+      keyRecord = loadKeyRecord(keyFile);
+      cfgRes = await apiRequest({ baseUrl, method: 'GET', subPath: `/config?${qs.toString()}`, keyRecord });
+    }
+  }
+
+  if (cfgRes.status >= 400) {
+    throw new Error(typeof cfgRes.data === 'string' ? cfgRes.data : JSON.stringify(cfgRes.data));
+  }
+
+  await stopLocalProxyDaemon(keyFile);
+
+  const { dir, daemonFile, configFile, logFile } = getDaemonStatePaths(keyFile);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const cfgText = typeof cfgRes.data === 'string' ? cfgRes.data : JSON.stringify(cfgRes.data, null, 2) + '\n';
+  fs.writeFileSync(configFile, cfgText, { encoding: 'utf8', mode: 0o600 });
+
+  execFileSync(resolvedBin, ['check', '-c', configFile], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 5000,
+  });
+
+  const logFd = fs.openSync(logFile, 'a', 0o600);
+  const child = spawn(resolvedBin, ['run', '-c', configFile], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    windowsHide: true,
+  });
+  child.unref();
+  fs.closeSync(logFd);
+
+  const deadline = Date.now() + 5000;
+  let ready = false;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(child.pid)) {
+      break;
+    }
+    if (await probeLoopbackPort(port, 200)) {
+      ready = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 120));
+  }
+
+  if (!ready) {
+    let logTail = '';
+    try {
+      logTail = fs.readFileSync(logFile, 'utf8').slice(-800);
+    } catch {}
+    try {
+      if (isPidAlive(child.pid)) process.kill(child.pid, 'SIGTERM');
+    } catch {}
+    throw new Error(`DAEMON_START_FAILED: sing-box did not bind 127.0.0.1:${port}. Log tail: ${logTail}`);
+  }
+
+  const startedAt = new Date().toISOString();
+  const stateObj = {
+    pid: child.pid,
+    port,
+    region: String(region || 'auto'),
+    singboxBin: resolvedBin,
+    configFile,
+    logFile,
+    startedAt,
+  };
+  fs.writeFileSync(daemonFile, JSON.stringify(stateObj, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+
+  const exitProbe = await probeHttpsViaHttpProxy({
+    proxyPort: port,
+    targetUrl: 'https://api.ipify.org?format=json',
+    timeoutMs: 6500,
+  });
+
+  return {
+    ok: true,
+    connected: true,
+    mode: 'rootless-proxy',
+    pid: child.pid,
+    region: String(region || 'auto'),
+    port,
+    httpProxy: `http://127.0.0.1:${port}`,
+    socks5Proxy: `socks5://127.0.0.1:${port}`,
+    envHint: `HTTPS_PROXY=http://127.0.0.1:${port} HTTP_PROXY=http://127.0.0.1:${port} ALL_PROXY=socks5://127.0.0.1:${port}`,
+    exitIp: exitProbe.data?.ip || null,
+    exitProbe,
+    ...(trialClaimed ? { trialClaimed } : {}),
+  };
+}
+
+// =============================================================================
+// Unified MCP Server (Auto-Detects Desktop App Bridge vs Zero-App Cloud + Daemon)
 // =============================================================================
 
 export const HEADLESS_MCP_TOOLS = [
   {
     name: 'get_capabilities',
     description:
-      'Return YIVPN Headless Agent VPN API capabilities, supported protocols (Hysteria2 + VLESS+REALITY), guardrail presets, payment rails, and local Ed25519 key status.',
+      'Return YIVPN Agent capabilities, active runtime mode (Desktop Bridge vs Zero-App Cloud/Daemon), detected sing-box binary, desktop MCP probe state, supported protocols (Hysteria2 + VLESS+REALITY), guardrail presets, and payment rails.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
     name: 'get_vpn_status',
     description:
-      'Inspect the signed Ed25519 VPN entitlement status (active, ready, expires_at, remaining_seconds, guardrails) and local keypair metadata.',
+      'Inspect BOTH the live local rootless proxy daemon state (127.0.0.1:10808 running/pid/proxy URLs) AND the signed Ed25519 VPN entitlement status (active, ready, expires_at, remaining_seconds, guardrails).',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -201,6 +738,52 @@ export const HEADLESS_MCP_TOOLS = [
     description:
       'List authorized multi-region Hysteria2 and VLESS exit nodes provisioned for this Ed25519 key.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'connect_vpn',
+    description:
+      'Start or switch the rootless local sing-box VPN proxy daemon (default 127.0.0.1:10808 mixed HTTP+SOCKS5 — zero root required, never drops SSH). Automatically claims the $0 90m/1GiB free trial if no active key exists and autoClaimTrial is true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        region: {
+          type: 'string',
+          enum: ['auto', 'US', 'JP', 'SG', 'HK'],
+          description: 'Target exit region (default: auto).',
+        },
+        port: {
+          type: 'integer',
+          description: 'Local loopback mixed HTTP/SOCKS5 port (default: 10808).',
+        },
+        autoClaimTrial: {
+          type: 'boolean',
+          description: 'Automatically mint a keypair and claim the $0 90m/1GiB free trial if no active entitlement exists (default: true).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'disconnect_vpn',
+    description:
+      'Cleanly stop the managed local rootless sing-box VPN proxy daemon without touching host routes or SSH sessions.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'diagnose_connection',
+    description:
+      'Diagnose DNS A/AAAA records, direct ISP reachability, and (when local proxy is running) encrypted VPN tunnel reachability/latency to a public domain or URL.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          description: 'Public domain or HTTPS URL (e.g. api.ipify.org or https://cloudflare.com/cdn-cgi/trace).',
+        },
+      },
+      required: ['target'],
+      additionalProperties: false,
+    },
   },
   {
     name: 'claim_free_trial',
@@ -246,7 +829,7 @@ export const HEADLESS_MCP_TOOLS = [
   {
     name: 'export_singbox_config',
     description:
-      'Fetch a ready-to-run rootless sing-box JSON configuration (default 127.0.0.1:10808 mixed HTTP/SOCKS5 proxy that never drops SSH) and optionally save it to outPath.',
+      'Fetch a ready-to-run sing-box JSON configuration (mode=proxy or mode=tun) and optionally write it to outPath.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -255,19 +838,6 @@ export const HEADLESS_MCP_TOOLS = [
         port: { type: 'integer', description: 'Local mixed proxy port when mode=proxy (default: 10808).' },
         outPath: { type: 'string', description: 'Optional file path to write the sing-box JSON configuration (mode 0600).' },
       },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'diagnose_connection',
-    description:
-      'Diagnose DNS A/AAAA records and direct HTTPS reachability/latency to a public domain or URL (blocks private/loopback targets).',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        target: { type: 'string', description: 'Public domain or HTTPS URL (e.g. api.ipify.org or https://cloudflare.com/cdn-cgi/trace).' },
-      },
-      required: ['target'],
       additionalProperties: false,
     },
   },
@@ -306,19 +876,67 @@ function isPrivateOrLoopbackHost(host) {
 
 async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
   if (name === 'get_capabilities') {
-    const disc = await apiRequest({ baseUrl, method: 'GET' });
+    const [disc, desktopProbe, localProxy] = await Promise.all([
+      apiRequest({ baseUrl, method: 'GET' }).catch((e) => ({ status: 0, data: { error: e?.message || String(e) } })),
+      detectDesktopMcpEnvironment(),
+      inspectLocalProxyDaemon(keyFile),
+    ]);
     const hasKey = fs.existsSync(keyFile);
     const pubkey = hasKey ? loadKeyRecord(keyFile).pubkey : null;
+    const singboxBin = resolveSingboxBinary();
     return {
-      mode: 'headless-ed25519-api',
+      mode: 'unified-headless-ed25519',
+      version: CLI_VERSION,
       platform: os.platform(),
       keyFile,
       hasLocalKeypair: hasKey,
       pubkey,
-      desktopMcpNote:
-        'Running in Headless Cloud/Container API mode. To control a local YIVPN Windows/macOS Desktop App instead, pass YIVPN_MCP_TOKEN=<yivpn_mcp_...> from YIVPN Settings -> Local MCP.',
+      singboxAvailable: Boolean(singboxBin),
+      singboxBin,
+      localProxy,
+      desktopMcpDetected: {
+        listening: desktopProbe.listening,
+        endpoint: desktopProbe.endpoint,
+        note: desktopProbe.listening
+          ? `YIVPN Desktop App Local MCP is listening at ${desktopProbe.endpoint}. Set YIVPN_MCP_TOKEN=<yivpn_mcp_...> to control live Desktop App split-tunneling instead.`
+          : 'No running YIVPN Desktop App Local MCP detected; operating in Zero-Account Cloud + Rootless Proxy Daemon mode.',
+      },
       serviceDiscovery: disc.data,
     };
+  }
+
+  if (name === 'get_vpn_status') {
+    const localProxy = await inspectLocalProxyDaemon(keyFile);
+    if (!fs.existsSync(keyFile)) {
+      return {
+        connected: localProxy.running,
+        localProxy,
+        hasLocalKeypair: false,
+        entitlement: null,
+        nextStepHint:
+          'Call connect_vpn (auto-claims the $0 90m/1GiB free trial on eligible local/residential ISPs and starts 127.0.0.1:10808) or purchase_vpn_entitlement on cloud VMs.',
+      };
+    }
+    const keyRecord = loadKeyRecord(keyFile);
+    const res = await apiRequest({ baseUrl, method: 'GET', subPath: '/status', keyRecord });
+    if (res.status >= 400) throw new Error(JSON.stringify(res.data));
+    return {
+      connected: localProxy.running,
+      localProxy,
+      hasLocalKeypair: true,
+      ...res.data,
+    };
+  }
+
+  if (name === 'connect_vpn') {
+    const region = String(args.region || 'auto');
+    const port = Number(args.port || 10808);
+    const autoTrial = args.autoClaimTrial !== undefined ? Boolean(args.autoClaimTrial) : true;
+    return await startLocalProxyDaemon({ baseUrl, keyFile, region, port, autoTrial });
+  }
+
+  if (name === 'disconnect_vpn') {
+    return await stopLocalProxyDaemon(keyFile);
   }
 
   if (name === 'claim_free_trial') {
@@ -340,7 +958,10 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
       subPath: '/entitlements',
       bodyObj: { pubkey: record.pubkey, months, rail, payment_method: 'card', currency },
     });
-    const out = typeof res.data === 'object' ? { statusCode: res.status, keyCreated: created, pubkey: record.pubkey, ...res.data } : { statusCode: res.status, body: res.data };
+    const out =
+      typeof res.data === 'object'
+        ? { statusCode: res.status, keyCreated: created, pubkey: record.pubkey, ...res.data }
+        : { statusCode: res.status, body: res.data };
     const payHeader = res.headers.get('payment-required');
     if (payHeader) out.paymentRequiredHeader = payHeader;
     return out;
@@ -353,9 +974,10 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
     if (isPrivateOrLoopbackHost(urlObj.hostname)) {
       throw new Error(`FORBIDDEN_TARGET: Refusing to probe private or loopback host "${urlObj.hostname}".`);
     }
-    const [v4, v6] = await Promise.all([
+    const [v4, v6, localProxy] = await Promise.all([
       dns.resolve4(urlObj.hostname).catch(() => []),
       dns.resolve6(urlObj.hostname).catch(() => []),
+      inspectLocalProxyDaemon(keyFile),
     ]);
     const started = Date.now();
     let directProbe;
@@ -365,21 +987,26 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
     } catch (e) {
       directProbe = { reachable: false, error: e?.message || String(e), latencyMs: Date.now() - started };
     }
+
+    const tunnelProbe = localProxy.running
+      ? await probeHttpsViaHttpProxy({
+          proxyPort: localProxy.port,
+          targetUrl: urlObj.toString(),
+          timeoutMs: 6000,
+        })
+      : null;
+
     return {
       target: rawTarget,
       host: urlObj.hostname,
       dns: { ipv4: v4, ipv6: v6 },
       directProbe,
+      localProxyRunning: localProxy.running,
+      tunnelProbe,
     };
   }
 
   const keyRecord = loadKeyRecord(keyFile);
-
-  if (name === 'get_vpn_status') {
-    const res = await apiRequest({ baseUrl, method: 'GET', subPath: '/status', keyRecord });
-    if (res.status >= 400) throw new Error(JSON.stringify(res.data));
-    return res.data;
-  }
 
   if (name === 'list_servers') {
     const res = await apiRequest({ baseUrl, method: 'GET', subPath: '/locations', keyRecord });
@@ -456,6 +1083,7 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
       return { ...res.data, keyFile, backupKeyFile: backupPath };
     }
     if (args.action === 'revoke') {
+      await stopLocalProxyDaemon(keyFile);
       const res = await apiRequest({ baseUrl, method: 'DELETE', subPath: '/entitlements', keyRecord });
       if (res.status >= 400) throw new Error(JSON.stringify(res.data));
       return res.data;
@@ -482,7 +1110,7 @@ export async function handleHeadlessMcpJsonRpc(msg, ctx) {
       result: {
         protocolVersion: requestedVersion === '2025-03-26' ? '2025-03-26' : '2024-11-05',
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'yivpn-agent-mcp', version: '1.2.0' },
+        serverInfo: { name: 'yivpn-agent-mcp', version: CLI_VERSION },
       },
     };
   }
@@ -552,11 +1180,12 @@ async function runDesktopMcpStdioBridge(mcpUrl, mcpToken) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          Host: parsed.host,
           ...(mcpToken ? { Authorization: `Bearer ${mcpToken}` } : {}),
         },
         body: JSON.stringify(msg),
       });
-      if (resp.status === 202 || isNotification) continue;
+      if (resp.status === 202 || resp.status === 204 || isNotification) continue;
       const text = await resp.text();
       if (!text.trim()) continue;
       const out = JSON.parse(text);
@@ -600,36 +1229,42 @@ async function runHeadlessMcpStdioServer(ctx) {
 }
 
 function printHelp() {
-  console.log(`yivpn-agent-cli v1.2.0 — Official YIVPN MCP Server & Zero-Account Agent VPN CLI
+  console.log(`yivpn-agent-cli v${CLI_VERSION} — Unified YIVPN AI Agent MCP Server, Proxy Daemon & API CLI
 
 Usage:
   yivpn-agent <command> [options]
 
 Commands:
-  mcp         Start Model Context Protocol (MCP) stdio server:
-                • Desktop Bridge Mode (when YIVPN_MCP_TOKEN / --mcp-token is set):
-                  Bridges stdio to YIVPN Desktop App Local MCP (127.0.0.1:38419/mcp) with live sing-box routing & rollback.
-                • Headless Cloud Mode (default in VMs/Docker without Desktop App):
-                  Exposes zero-account Ed25519 + $0 Trial / Checkout / x402 Agent VPN API tools over MCP.
+  mcp         Start unified Model Context Protocol (MCP) stdio server (auto-detects environment):
+                • Desktop App Bridge (auto-selected when YIVPN_MCP_TOKEN / --desktop is provided):
+                  Auto-discovers YIVPN Desktop App Local MCP port (mcp-config.json / 38410 / 38419) for live sing-box routing & rollback.
+                • Zero-App Cloud + Rootless Daemon Mode (auto-selected in VMs, Docker & keyless setups):
+                  Exposes 11 MCP tools including connect_vpn, disconnect_vpn, claim_free_trial ($0 90m/1GiB), guardrails & x402/Checkout.
+  connect     Start or switch the managed rootless sing-box proxy on 127.0.0.1:10808 (--region auto|US|JP|SG|HK --auto-trial)
+  disconnect  Stop the managed rootless sing-box proxy daemon cleanly
   trial       Claim an instant $0 90-minute / 1 GiB free trial on US-Ohio (mints keypair automatically; residential/local ISPs)
   keygen      Generate a local Ed25519 keypair (~/.yivpn-agent/key.json)
   discover    Query unauthenticated service capabilities, terms & payment rails
   buy         Purchase/extend multi-region VPN time (--months 1|3|6|12 --rail checkout|x402)
-  status      Inspect signed key status (--wait to poll until active=true)
+  status      Inspect live local proxy daemon + signed Ed25519 entitlement status (--wait to poll until active=true)
   locations   List provisioned Hysteria2 & VLESS+REALITY exit nodes
   settings    Read or update DNS guardrails (--guardrails malware,ads --region US)
-  config      Fetch ready-to-run rootless sing-box config (--mode proxy|tun --out file.json)
+  config      Export raw sing-box config (--mode proxy|tun --out file.json)
   rotate      Atomically migrate remaining time to a newly generated Ed25519 keypair
-  revoke      Immediately revoke entitlement and disable upstream credentials
-  selftest    Verify local Ed25519 signing and MCP JSON-RPC protocol round-trip
+  revoke      Stop local daemon and immediately revoke entitlement
+  selftest    Verify Ed25519 signing, environment auto-detection, proxy probe, and MCP JSON-RPC round-trip
 
 Options:
-  --mcp-url <url>     Desktop Local MCP URL (default: http://127.0.0.1:38419/mcp or $YIVPN_MCP_URL)
-  --mcp-token <tok>   Desktop Local MCP token ($YIVPN_MCP_TOKEN)
-  --headless          Force Headless Ed25519 API MCP mode even if YIVPN_MCP_TOKEN is set
-  --desktop           Force Desktop App MCP bridge mode
-  --key-file <path>   Path to Ed25519 key JSON (default: ~/.yivpn-agent/key.json)
-  --api-base <url>    API base URL (default: https://yivpn.net/api/v1/vpn)
+  --mcp-url <url>       Desktop Local MCP URL ($YIVPN_MCP_URL; auto-discovers 38410 / 38419 when omitted)
+  --mcp-token <tok>     Desktop Local MCP token ($YIVPN_MCP_TOKEN)
+  --headless            Force Zero-App Cloud/Daemon MCP mode even if YIVPN_MCP_TOKEN is set
+  --desktop             Force Desktop App MCP bridge mode
+  --region <code>       Target region for connect / config / settings (auto|US|JP|SG|HK)
+  --port <num>          Local proxy port for connect / config (default: 10808)
+  --auto-trial          Auto-claim $0 90m/1GiB free trial during "connect" if no active key exists
+  --singbox-bin <path>  Explicit path to sing-box binary ($YIVPN_SINGBOX_BIN)
+  --key-file <path>     Path to Ed25519 key JSON (default: ~/.yivpn-agent/key.json)
+  --api-base <url>      API base URL (default: https://yivpn.net/api/v1/vpn)
 `);
 }
 
@@ -644,11 +1279,12 @@ async function run() {
   const keyFile = path.resolve(String(flags['key-file'] || DEFAULT_KEY_PATH));
 
   if (command === 'mcp') {
-    const mcpUrl = String(flags['mcp-url'] || DEFAULT_DESKTOP_MCP_URL);
+    const explicitMcpUrl = flags['mcp-url'] ? String(flags['mcp-url']) : process.env.YIVPN_MCP_URL || '';
     const mcpToken = flags['mcp-token'] ? String(flags['mcp-token']) : process.env.YIVPN_MCP_TOKEN || '';
     const useDesktop = Boolean(flags.desktop || (!flags.headless && mcpToken));
     if (useDesktop) {
-      await runDesktopMcpStdioBridge(mcpUrl, mcpToken);
+      const detected = await detectDesktopMcpEnvironment(explicitMcpUrl);
+      await runDesktopMcpStdioBridge(detected.endpoint, mcpToken);
     } else {
       await runHeadlessMcpStdioServer({ baseUrl, keyFile });
     }
@@ -668,16 +1304,50 @@ async function run() {
     const ok = crypto.verify(null, Buffer.from(payload, 'utf8'), pubObj, Buffer.from(hdrs['X-YIVPN-Signature'], 'base64'));
     assert.equal(ok, true, 'ed25519-v1 self-test verification failed');
 
+    const tmpKeyFile = path.join(os.tmpdir(), `yivpn-selftest-${process.pid}-${Date.now()}`, 'key.json');
     const initRes = await handleHeadlessMcpJsonRpc(
-      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } },
-      { baseUrl, keyFile }
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } },
+      { baseUrl, keyFile: tmpKeyFile }
     );
     assert.equal(initRes.result.serverInfo.name, 'yivpn-agent-mcp');
+    assert.equal(initRes.result.serverInfo.version, CLI_VERSION);
+
     const toolsRes = await handleHeadlessMcpJsonRpc(
       { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
-      { baseUrl, keyFile }
+      { baseUrl, keyFile: tmpKeyFile }
     );
-    assert.equal(toolsRes.result.tools.length, 9);
+    assert.equal(toolsRes.result.tools.length, 11);
+    const toolNames = toolsRes.result.tools.map((t) => t.name);
+    for (const coreTool of [
+      'get_capabilities',
+      'get_vpn_status',
+      'list_servers',
+      'connect_vpn',
+      'disconnect_vpn',
+      'diagnose_connection',
+    ]) {
+      assert.ok(toolNames.includes(coreTool), `Missing unified MCP tool: ${coreTool}`);
+    }
+
+    // Keyless get_vpn_status & disconnect_vpn must succeed cleanly without throwing
+    const statusRes = await handleHeadlessMcpJsonRpc(
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'get_vpn_status', arguments: {} } },
+      { baseUrl, keyFile: tmpKeyFile }
+    );
+    assert.equal(statusRes.result.isError, false);
+    assert.equal(statusRes.result.structuredContent.hasLocalKeypair, false);
+    assert.equal(statusRes.result.structuredContent.connected, false);
+
+    const discRes = await handleHeadlessMcpJsonRpc(
+      { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'disconnect_vpn', arguments: {} } },
+      { baseUrl, keyFile: tmpKeyFile }
+    );
+    assert.equal(discRes.result.isError, false);
+    assert.equal(discRes.result.structuredContent.disconnected, true);
+
+    const desktopProbe = await detectDesktopMcpEnvironment();
+    assert.ok(desktopProbe.endpoint.startsWith('http://127.0.0.1:'));
+
     const devHash = computeDeviceHash();
     if (devHash) {
       assert.match(devHash, /^[0-9a-f]{64}$/);
@@ -687,9 +1357,11 @@ async function run() {
       JSON.stringify(
         {
           ok: true,
-          version: '1.2.0',
+          version: CLI_VERSION,
           profile: 'ed25519-v1',
           mcpTools: toolsRes.result.tools.length,
+          singboxDetected: Boolean(resolveSingboxBinary()),
+          desktopMcpListening: desktopProbe.listening,
           deviceHashAvailable: Boolean(devHash),
           pubkey_sample: rec.pubkey,
         },
@@ -697,6 +1369,22 @@ async function run() {
         2
       )
     );
+    return;
+  }
+
+  if (command === 'connect') {
+    const region = String(flags.region || 'auto');
+    const port = Number(flags.port || 10808);
+    const autoTrial = Boolean(flags['auto-trial'] || flags.trial);
+    const singboxBin = flags['singbox-bin'] ? String(flags['singbox-bin']) : '';
+    const out = await startLocalProxyDaemon({ baseUrl, keyFile, region, port, autoTrial, singboxBin });
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+
+  if (command === 'disconnect') {
+    const out = await stopLocalProxyDaemon(keyFile);
+    console.log(JSON.stringify(out, null, 2));
     return;
   }
 
@@ -752,22 +1440,32 @@ async function run() {
     return;
   }
 
-  const keyRecord = loadKeyRecord(keyFile);
-
   if (command === 'status') {
+    const localProxy = await inspectLocalProxyDaemon(keyFile);
+    if (!fs.existsSync(keyFile)) {
+      console.log(JSON.stringify({ ok: true, has_local_keypair: false, local_proxy: localProxy }, null, 2));
+      return;
+    }
+    const keyRecord = loadKeyRecord(keyFile);
     const wait = Boolean(flags.wait);
     const timeoutMs = Number(flags['timeout-sec'] || 300) * 1000;
     const deadline = Date.now() + timeoutMs;
     while (true) {
       const res = await apiRequest({ baseUrl, method: 'GET', subPath: '/status', keyRecord });
       if (!wait || (res.data?.active && res.data?.ready) || Date.now() >= deadline) {
-        console.log(JSON.stringify(res.data, null, 2));
+        const merged =
+          typeof res.data === 'object' && res.data !== null
+            ? { ...res.data, local_proxy: localProxy }
+            : { body: res.data, local_proxy: localProxy };
+        console.log(JSON.stringify(merged, null, 2));
         if (res.status >= 400) process.exitCode = 1;
         return;
       }
       await new Promise((r) => setTimeout(r, 3000));
     }
   }
+
+  const keyRecord = loadKeyRecord(keyFile);
 
   if (command === 'locations') {
     const res = await apiRequest({ baseUrl, method: 'GET', subPath: '/locations', keyRecord });
@@ -862,6 +1560,7 @@ async function run() {
   }
 
   if (command === 'revoke') {
+    await stopLocalProxyDaemon(keyFile);
     const res = await apiRequest({ baseUrl, method: 'DELETE', subPath: '/entitlements', keyRecord });
     console.log(JSON.stringify(res.data, null, 2));
     if (res.status >= 400) process.exitCode = 1;
@@ -871,7 +1570,18 @@ async function run() {
   throw new Error(`Unknown command "${command}". Run "yivpn-agent --help" for usage.`);
 }
 
-run().catch((err) => {
-  console.error(JSON.stringify({ ok: false, error: err?.message || String(err) }, null, 2));
-  process.exitCode = 1;
-});
+const isMainModule = (() => {
+  try {
+    if (!process.argv[1]) return false;
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return true;
+  }
+})();
+
+if (isMainModule) {
+  run().catch((err) => {
+    console.error(JSON.stringify({ ok: false, error: err?.message || String(err) }, null, 2));
+    process.exitCode = 1;
+  });
+}
