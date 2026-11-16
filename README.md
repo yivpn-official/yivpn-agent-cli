@@ -1,20 +1,21 @@
-# yivpn-agent-cli (v2.1.0 — Unified AI Agent MCP Server, Proxy Daemon & VPN API CLI)
+# yivpn-agent-cli (v2.2.0 — Unified AI Agent MCP Server, Proxy Daemon & VPN API CLI)
 
-Official zero-dependency **Model Context Protocol (MCP)** server, built-in **rootless `sing-box 1.12+ / 1.14+` proxy daemon**, optional **safe Windows/macOS system proxy manager**, Node.js CLI, Python `ed25519-v1` reference signer, and AI Agent `SKILL.md` for **[YIVPN AI Agent & Developer Hub](https://yivpn.net/en/vpn-api/)**.
+Official zero-dependency **Model Context Protocol (MCP)** server, built-in **rootless `sing-box 1.12+ / 1.14+` proxy daemon**, **conflict-safe Windows/macOS system proxy manager with automatic trial-expiry restore watchdog**, Node.js CLI, Python `ed25519-v1` reference signer, and AI Agent `SKILL.md` for **[YIVPN AI Agent & Developer Hub](https://yivpn.net/en/vpn-api/)**.
 
-### Environment-Aware Routing (Cloud VM vs Personal Desktop)
+### Environment-Aware Routing & Safety Guardrails (`v2.2.0`)
 
 1. **Zero-App Cloud, Docker & Headless Sandbox (`127.0.0.1:10808` Only — Zero SSH Drop)**:
    - Zero email registration, zero GUI app, zero `root` privileges, and **never touches Linux host routes**.
    - Instant **`$0` 90-minute / 1 GiB Free Trial** (`connect --auto-trial` — works directly on domestic ISPs AND behind existing proxies/cloud sandboxes) or multi-region `US/JP/SG/HK` via Hosted Checkout (`$2.99` / `¥19.90`) or `x402` Base USDC.
-2. **Personal Windows / macOS Workstation (`--system-proxy` or Desktop GUI Bridge)**:
-   - Detects installed **YIVPN Desktop (`v1.0.4+`)** automatically (which includes **90 min/day free global OS TUN** with zero account required, plus Local MCP live split-tunneling when `YIVPN_MCP_TOKEN` is set).
-   - When running without the Desktop GUI, pass `--system-proxy` (`connect --auto-trial --system-proxy`) to route Chrome/Edge/Safari through `127.0.0.1:10808` and automatically restore OS proxy settings on `disconnect`.
+2. **Personal Windows / macOS Workstation (Desktop GUI Priority + Conflict-Safe `--system-proxy`)**:
+   - Detects installed **YIVPN Desktop (`v1.0.5+`)** (`status` → `desktop_app.installed` / `launch-desktop`), which provides **90 min/day free global OS TUN** with zero login, no `1 GiB` cap, and zero WinINET registry conflicts.
+   - Detects active third-party proxies (`Karing`, `Clash`, `Mihomo`, `v2rayN` via `osSystemProxy.portListening` + `ownerProcess`) and refuses to clobber their OS system proxy unless `--force-system-proxy` is passed.
+   - When `--system-proxy` is applied, spawns an **`autoRestoreWatchdog`** that automatically restores previous OS proxy settings on `disconnect`, if `sing-box` exits, or when the 90-minute trial expires (browsers never hang on a dead port).
 3. **Mainland China Zero-Proxy Bootstrap (GFW-Safe First-Party Mirror)**:
-   - If `github.com` is unreachable before connecting, download the single-file CLI directly from `https://yivpn.net/vpn-api/yivpn-agent.mjs` (checksum at `https://yivpn.net/vpn-api/yivpn-agent.mjs.sha256`).
+   - Download `bin/yivpn-agent.mjs` directly from `https://yivpn.net/vpn-api/yivpn-agent.mjs` into `~/.yivpn-agent/yivpn-agent.mjs` (SHA-256: `0129bc9b459494ed779d7574dc962c22a190afa08c0228a70cf46e22553ee76b`, checksum endpoint: `https://yivpn.net/vpn-api/yivpn-agent.mjs.sha256`).
 
 - **Unified Human Docs**: [`https://yivpn.net/en/vpn-api/`](https://yivpn.net/en/vpn-api/) ([简体中文](https://yivpn.net/vpn-api/))
-- **Unified Agent Quickstart (`llms.txt`)**: [`https://yivpn.net/vpn-api/llms.txt`](https://yivpn.net/vpn-api/llms.txt)
+- **Unified Agent Quickstart (`llms.txt v2.2`)**: [`https://yivpn.net/vpn-api/llms.txt?v=2.2`](https://yivpn.net/vpn-api/llms.txt?v=2.2)
 - **First-Party CLI Mirror (No-Proxy China Safe)**: [`https://yivpn.net/vpn-api/yivpn-agent.mjs`](https://yivpn.net/vpn-api/yivpn-agent.mjs)
 - **OpenAPI 3.1 Specification**: [`https://yivpn.net/vpn-api/openapi.yaml`](https://yivpn.net/vpn-api/openapi.yaml)
 - **Live Discovery API**: [`https://yivpn.net/api/v1/vpn`](https://yivpn.net/api/v1/vpn)
@@ -26,42 +27,50 @@ Official zero-dependency **Model Context Protocol (MCP)** server, built-in **roo
 Copy & paste into **Claude Code**, **OpenAI Codex**, **Cursor**, **Doubao**, **Windsurf**, or **OpenClaw**:
 
 ```text
-Read https://yivpn.net/vpn-api/llms.txt and auto-connect this environment to YIVPN (claim the free 90-min trial if needed).
+Read the latest guide at https://yivpn.net/vpn-api/llms.txt?v=2.2 and auto-connect this environment to YIVPN (claim the free 90-min trial if needed).
 ```
 
 ---
 
 ## Quickstart Commands (Node.js 20+)
 
-### A. Mainland China (Zero Proxy Enabled — Bypass GitHub Timeout)
+### A. Recommended Persistent Single-File Setup (Mainland China & Global Safe)
 ```bash
-curl -fsSL https://yivpn.net/vpn-api/yivpn-agent.mjs -o yivpn-agent.mjs
+mkdir -p ~/.yivpn-agent
+curl -fsSL https://yivpn.net/vpn-api/yivpn-agent.mjs -o ~/.yivpn-agent/yivpn-agent.mjs
+
+# Pre-check installed Desktop App & any active external proxy:
+node ~/.yivpn-agent/yivpn-agent.mjs status
 
 # Linux / Cloud VM / Terminal-only proxy (127.0.0.1:10808, SSH-safe):
-node yivpn-agent.mjs connect --auto-trial
+node ~/.yivpn-agent/yivpn-agent.mjs connect --auto-trial
 
-# Personal Windows / macOS PC (also enables browser system proxy, restored on disconnect):
-node yivpn-agent.mjs connect --auto-trial --system-proxy
+# Personal Windows / macOS PC (conflict-safe browser system proxy + expiry auto-restore watchdog):
+node ~/.yivpn-agent/yivpn-agent.mjs connect --auto-trial --system-proxy
+
+# Verify direct ISP vs tunnel exit (--noproxy "*" bypasses existing env proxies):
+curl -fsSL --noproxy "*" https://cloudflare.com/cdn-cgi/trace
+curl -fsSL -x http://127.0.0.1:10808 https://cloudflare.com/cdn-cgi/trace
 
 # Stop daemon & restore OS system proxy cleanly:
-node yivpn-agent.mjs disconnect
+node ~/.yivpn-agent/yivpn-agent.mjs disconnect
 ```
 
-### B. Standard `npx` CLI & Unified MCP Server
+### B. Unified MCP Server Registration (`stdio`)
 ```bash
-# Register MCP (Cloud / Docker / Zero-App Sandbox — exposes 11 tools)
-claude mcp add yivpn -- npx --yes github:yivpn-official/yivpn-agent-cli mcp
+# Register MCP (Zero-App Cloud / Docker / Sandbox — exposes 11 tools)
+claude mcp add yivpn -- node ~/.yivpn-agent/yivpn-agent.mjs mcp
 
-# Register MCP (YIVPN Desktop App v1.0.4+ Local Split-Tunneling Bridge — exposes 8 live kernel tools)
-claude mcp add yivpn -e YIVPN_MCP_TOKEN=yivpn_mcp_<YOUR_TOKEN> -- npx --yes github:yivpn-official/yivpn-agent-cli mcp
+# Register MCP (YIVPN Desktop App v1.0.5+ Local Split-Tunneling Bridge — exposes 8 live kernel tools)
+claude mcp add yivpn -e YIVPN_MCP_TOKEN=yivpn_mcp_<YOUR_TOKEN> -- node ~/.yivpn-agent/yivpn-agent.mjs mcp
 
 # Paid Multi-Region Plan ($2.99 / ¥19.90 1mo — unlocks US/JP/SG/HK across 5 concurrent devices)
-npx --yes github:yivpn-official/yivpn-agent-cli buy --months 1 --rail checkout
-npx --yes github:yivpn-official/yivpn-agent-cli status --wait
-npx --yes github:yivpn-official/yivpn-agent-cli connect --region JP
+node ~/.yivpn-agent/yivpn-agent.mjs buy --months 1 --rail checkout
+node ~/.yivpn-agent/yivpn-agent.mjs status --wait
+node ~/.yivpn-agent/yivpn-agent.mjs connect --region JP
 
 # Fast large file download once 127.0.0.1:10808 is active:
-curl -fL --proxy http://127.0.0.1:10808 https://yivpn.net/downloads/YIVPN_1.0.4_x64.msi -o YIVPN_1.0.4_x64.msi
+curl -fL --proxy http://127.0.0.1:10808 https://yivpn.net/downloads/YIVPN_1.0.5_x64.msi -o YIVPN_1.0.5_x64.msi
 ```
 
 ---
@@ -82,7 +91,7 @@ yivpn-ed25519-v1
 <LOWERCASE_SHA256_HEX_OF_RAW_REQUEST_BODY>
 ```
 
-See [`bin/yivpn-agent.mjs`](./bin/yivpn-agent.mjs) (zero-dependency Node.js) and [`python/sign_request.py`](./python/sign_request.py) (Python 3) for reference implementations.
+See [`bin/yivpn-agent.mjs`](./bin/yivpn-agent.mjs) (zero-dependency Node.js, SHA-256 `0129bc9b459494ed779d7574dc962c22a190afa08c0228a70cf46e22553ee76b`) and [`python/sign_request.py`](./python/sign_request.py) (Python 3) for reference implementations.
 
 ---
 
