@@ -11,8 +11,40 @@ import readline from 'node:readline';
 import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
 
-export const CLI_VERSION = '2.2.0';
+export const CLI_VERSION = '2.2.1';
 const DEFAULT_BASE_URL = process.env.YIVPN_API_BASE || 'https://yivpn.net/api/v1/vpn';
+const ALLOW_CUSTOM_API_BASE_ENV = process.env.YIVPN_ALLOW_CUSTOM_API_BASE === '1';
+
+export function validateTrustedApiBase(rawBase, allowCustom = false) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawBase || '').trim());
+  } catch {
+    throw new Error(`INVALID_API_BASE: "${rawBase}" is not a valid URL.`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('INVALID_API_BASE: Credentials in API base URL are forbidden.');
+  }
+  const host = parsed.hostname.toLowerCase();
+  const isOfficial =
+    parsed.protocol === 'https:' &&
+    (host === 'yivpn.net' || host === 'www.yivpn.net') &&
+    (parsed.pathname === '/api/v1/vpn' || parsed.pathname.startsWith('/api/v1/vpn/'));
+  if (isOfficial) {
+    return parsed.toString().replace(/\/+$/, '');
+  }
+  if (!allowCustom && !ALLOW_CUSTOM_API_BASE_ENV) {
+    throw new Error(
+      `UNTRUSTED_API_BASE: Refusing non-official API base "${parsed.origin}" without --allow-custom-api-base (or YIVPN_ALLOW_CUSTOM_API_BASE=1).`
+    );
+  }
+  const isLocalLoopback =
+    parsed.protocol === 'http:' && (host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]');
+  if (parsed.protocol !== 'https:' && !isLocalLoopback) {
+    throw new Error('INSECURE_API_BASE: Custom API base must use https:// (or loopback http://127.0.0.1 for local testing).');
+  }
+  return parsed.toString().replace(/\/+$/, '');
+}
 const DEFAULT_AGENT_DIR = process.env.YIVPN_AGENT_DIR || path.join(os.homedir(), '.yivpn-agent');
 const DEFAULT_KEY_PATH = process.env.YIVPN_KEY_FILE || path.join(DEFAULT_AGENT_DIR, 'key.json');
 const DESKTOP_DEFAULT_PORTS = [38410, 38419];
@@ -90,8 +122,15 @@ function loadOrCreateKeyRecord(keyFile) {
 }
 
 function saveKeyRecord(keyFile, record) {
-  fs.mkdirSync(path.dirname(keyFile), { recursive: true, mode: 0o700 });
+  const dir = path.dirname(keyFile);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {}
   fs.writeFileSync(keyFile, JSON.stringify(record, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.chmodSync(keyFile, 0o600);
+  } catch {}
 }
 
 export function buildSigningPayload(method, canonicalPath, timestamp, rawBody = '') {
@@ -1013,7 +1052,7 @@ export function probeHttpsViaHttpProxy({ proxyHost = '127.0.0.1', proxyPort, tar
         finish({
           reachable: Boolean(httpStatus),
           httpStatus,
-          ...(parsedJson ? { data: parsedJson } : body ? { bodyPreview: body.slice(0, 240) } : {}),
+          ...(parsedJson && targetHost === 'api.ipify.org' ? { data: parsedJson } : {}),
         });
       });
     }
@@ -1129,12 +1168,19 @@ async function startLocalProxyDaemon({
     throw new Error(typeof cfgRes.data === 'string' ? cfgRes.data : JSON.stringify(cfgRes.data));
   }
 
+  const cfgText = validateRemoteSingboxConfig(cfgRes.data, 'proxy', port);
+
   await stopLocalProxyDaemon(keyFile, port);
 
   const { dir, daemonFile, configFile, logFile } = getDaemonStatePaths(keyFile);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const cfgText = typeof cfgRes.data === 'string' ? cfgRes.data : JSON.stringify(cfgRes.data, null, 2) + '\n';
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {}
   fs.writeFileSync(configFile, cfgText, { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.chmodSync(configFile, 0o600);
+  } catch {}
 
   try {
     execFileSync(resolvedBin, ['check', '-c', configFile], {
@@ -1253,9 +1299,13 @@ async function startLocalProxyDaemon({
   if (systemProxyResult.applied) {
     try {
       const selfPath = fileURLToPath(import.meta.url);
+      const wdArgs = [selfPath, '__watchdog', '--key-file', keyFile, '--api-base', baseUrl];
+      if (baseUrl !== 'https://yivpn.net/api/v1/vpn') {
+        wdArgs.push('--allow-custom-api-base');
+      }
       const wd = spawn(
         process.execPath,
-        [selfPath, '__watchdog', '--key-file', keyFile, '--api-base', baseUrl],
+        wdArgs,
         {
           detached: true,
           stdio: 'ignore',
@@ -1458,22 +1508,207 @@ export const HEADLESS_MCP_TOOLS = [
   },
 ];
 
-function isPrivateOrLoopbackHost(host) {
-  const h = host.trim().toLowerCase();
+const PRIVATE_IP_BLOCKLIST = (() => {
+  const bl = new net.BlockList();
+  bl.addSubnet('0.0.0.0', 8, 'ipv4');
+  bl.addSubnet('10.0.0.0', 8, 'ipv4');
+  bl.addSubnet('100.64.0.0', 10, 'ipv4');
+  bl.addSubnet('127.0.0.0', 8, 'ipv4');
+  bl.addSubnet('169.254.0.0', 16, 'ipv4');
+  bl.addSubnet('172.16.0.0', 12, 'ipv4');
+  bl.addSubnet('192.0.0.0', 24, 'ipv4');
+  bl.addSubnet('192.0.2.0', 24, 'ipv4');
+  bl.addSubnet('192.88.99.0', 24, 'ipv4');
+  bl.addSubnet('192.168.0.0', 16, 'ipv4');
+  bl.addSubnet('198.18.0.0', 15, 'ipv4');
+  bl.addSubnet('198.51.100.0', 24, 'ipv4');
+  bl.addSubnet('203.0.113.0', 24, 'ipv4');
+  bl.addSubnet('224.0.0.0', 4, 'ipv4');
+  bl.addSubnet('240.0.0.0', 4, 'ipv4');
+  bl.addAddress('::', 'ipv6');
+  bl.addAddress('::1', 'ipv6');
+  bl.addSubnet('fc00::', 7, 'ipv6');
+  bl.addSubnet('fe80::', 10, 'ipv6');
+  bl.addSubnet('ff00::', 8, 'ipv6');
+  return bl;
+})();
+
+export function isBlockedIpAddress(rawIp) {
+  const clean = String(rawIp || '').trim().replace(/^\[|\]$/g, '').toLowerCase();
+  const ver = net.isIP(clean);
+  if (ver === 4) {
+    return PRIVATE_IP_BLOCKLIST.check(clean, 'ipv4');
+  }
+  if (ver === 6) {
+    if (clean.startsWith('::ffff:')) {
+      const mapped = clean.slice(7);
+      if (net.isIP(mapped) === 4) return PRIVATE_IP_BLOCKLIST.check(mapped, 'ipv4');
+      const hexMatch = mapped.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+      if (hexMatch) {
+        const hi = Number.parseInt(hexMatch[1], 16);
+        const lo = Number.parseInt(hexMatch[2], 16);
+        const v4 = `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+        return PRIVATE_IP_BLOCKLIST.check(v4, 'ipv4');
+      }
+      return true;
+    }
+    return PRIVATE_IP_BLOCKLIST.check(clean, 'ipv6');
+  }
+  return true;
+}
+
+export function isPrivateOrLoopbackHost(host) {
+  const h = String(host || '').trim().replace(/^\[|\]$/g, '').toLowerCase();
+  if (!h || h.length > 253) return true;
+  if (h.startsWith('\\') || h.startsWith('/') || /[\s/\\?#@%]/.test(h)) return true;
   if (
     h === 'localhost' ||
+    h.endsWith('.localhost') ||
     h.endsWith('.local') ||
-    h.endsWith('.internal') ||
-    h === '127.0.0.1' ||
-    h === '::1' ||
-    h.startsWith('10.') ||
-    h.startsWith('192.168.') ||
-    h.startsWith('169.254.') ||
-    /^172\.(1[6-9]|2\d|3[0-1])\./.test(h)
+    h.endsWith('.internal')
   ) {
     return true;
   }
+  // Reject integer / hex / octal single-token or non-standard numeric IPv4 notations
+  if (/^(?:0x[0-9a-f]+|\d+)$/i.test(h)) return true;
+  if (/^[0-9x.]+$/i.test(h) && net.isIP(h) !== 4) return true;
+  if (net.isIP(h)) {
+    return isBlockedIpAddress(h);
+  }
   return false;
+}
+
+const FORBIDDEN_SINGBOX_CONFIG_KEYS = new Set([
+  'output',
+  'cache_file',
+  'clash_api',
+  'v2ray_api',
+  'pprof',
+  'acme',
+  'ech',
+  'external_ui',
+  'external_ui_download_url',
+]);
+
+function assertNoDangerousSingboxKeys(node, pathTrace = 'root') {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i += 1) {
+      assertNoDangerousSingboxKeys(node[i], `${pathTrace}[${i}]`);
+    }
+    return;
+  }
+  for (const [k, v] of Object.entries(node)) {
+    const lk = k.toLowerCase();
+    if (
+      FORBIDDEN_SINGBOX_CONFIG_KEYS.has(lk) ||
+      lk.endsWith('_path') ||
+      lk.endsWith('_directory')
+    ) {
+      throw new Error(`UNSAFE_REMOTE_CONFIG: Forbidden sing-box key "${k}" at ${pathTrace}.${k}`);
+    }
+    assertNoDangerousSingboxKeys(v, `${pathTrace}.${k}`);
+  }
+}
+
+export function validateRemoteSingboxConfig(rawData, expectedMode = 'proxy', expectedPort = 10808) {
+  let cfg;
+  try {
+    cfg = typeof rawData === 'string' ? JSON.parse(rawData) : structuredClone(rawData);
+  } catch {
+    throw new Error('UNSAFE_REMOTE_CONFIG: Response is not valid JSON.');
+  }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    throw new Error('UNSAFE_REMOTE_CONFIG: Root configuration must be a JSON object.');
+  }
+  assertNoDangerousSingboxKeys(cfg);
+
+  if (!Array.isArray(cfg.inbounds) || cfg.inbounds.length === 0 || cfg.inbounds.length > 4) {
+    throw new Error('UNSAFE_REMOTE_CONFIG: Configuration must define 1..4 inbounds.');
+  }
+  for (const inb of cfg.inbounds) {
+    if (!inb || typeof inb !== 'object') {
+      throw new Error('UNSAFE_REMOTE_CONFIG: Malformed inbound entry.');
+    }
+    const t = String(inb.type || '').toLowerCase();
+    if (expectedMode === 'proxy') {
+      if (!['mixed', 'socks', 'http'].includes(t)) {
+        throw new Error(`UNSAFE_REMOTE_CONFIG: Disallowed inbound type "${t}" in proxy mode.`);
+      }
+      if (inb.listen !== '127.0.0.1') {
+        throw new Error(`UNSAFE_REMOTE_CONFIG: Proxy inbound must bind strictly to 127.0.0.1 (got "${inb.listen}").`);
+      }
+      const lp = Number(inb.listen_port);
+      if (!Number.isInteger(lp) || lp < 1024 || lp > 65535 || (expectedPort && lp !== Number(expectedPort))) {
+        throw new Error(`UNSAFE_REMOTE_CONFIG: Unexpected inbound listen_port "${inb.listen_port}".`);
+      }
+    } else if (!['tun', 'mixed', 'socks', 'http'].includes(t)) {
+      throw new Error(`UNSAFE_REMOTE_CONFIG: Disallowed inbound type "${t}".`);
+    }
+  }
+
+  if (!Array.isArray(cfg.outbounds) || cfg.outbounds.length === 0 || cfg.outbounds.length > 16) {
+    throw new Error('UNSAFE_REMOTE_CONFIG: Configuration must define 1..16 outbounds.');
+  }
+  const ALLOWED_PROXY_TYPES = new Set([
+    'vless', 'vmess', 'trojan', 'shadowsocks', 'anytls', 'hysteria', 'hysteria2', 'tuic', 'socks', 'http',
+  ]);
+  for (const ob of cfg.outbounds) {
+    if (!ob || typeof ob !== 'object') {
+      throw new Error('UNSAFE_REMOTE_CONFIG: Malformed outbound entry.');
+    }
+    const t = String(ob.type || '').toLowerCase();
+    if (t === 'direct' || t === 'block' || t === 'dns') continue;
+    if (!ALLOWED_PROXY_TYPES.has(t)) {
+      throw new Error(`UNSAFE_REMOTE_CONFIG: Unsupported outbound type "${t}".`);
+    }
+    const srv = String(ob.server || '').trim();
+    const sp = Number(ob.server_port);
+    if (!srv || isPrivateOrLoopbackHost(srv) || !Number.isInteger(sp) || sp < 1 || sp > 65535) {
+      throw new Error(`UNSAFE_REMOTE_CONFIG: Outbound server "${srv}:${ob.server_port}" must be a public endpoint.`);
+    }
+  }
+  return JSON.stringify(cfg, null, 2) + '\n';
+}
+
+export function validateSafeConfigOutputPath(rawOutPath, keyFile = DEFAULT_KEY_PATH, { confineToAgentDirs = true } = {}) {
+  const candidate = path.resolve(String(rawOutPath || '').trim());
+  if (!candidate.toLowerCase().endsWith('.json')) {
+    throw new Error('UNSAFE_OUTPUT_PATH: Output file must have a .json extension.');
+  }
+  const parentDir = path.dirname(candidate);
+  fs.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+  const realParent = fs.realpathSync(parentDir);
+  const finalTarget = path.join(realParent, path.basename(candidate));
+
+  if (fs.existsSync(finalTarget) && fs.lstatSync(finalTarget).isSymbolicLink()) {
+    throw new Error('UNSAFE_OUTPUT_PATH: Refusing to overwrite a symbolic link.');
+  }
+
+  if (confineToAgentDirs) {
+    const allowedRoots = [
+      DEFAULT_AGENT_DIR,
+      path.dirname(path.resolve(keyFile)),
+      os.tmpdir(),
+    ].map((root) => {
+      try {
+        fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+        return fs.realpathSync(root);
+      } catch {
+        return path.resolve(root);
+      }
+    });
+    const isInsideRoot = allowedRoots.some((root) => {
+      const rel = path.relative(root, finalTarget);
+      return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+    });
+    if (!isInsideRoot) {
+      throw new Error(
+        `UNSAFE_OUTPUT_PATH: MCP export outPath must be inside ${DEFAULT_AGENT_DIR} or system temp directory.`
+      );
+    }
+  }
+  return finalTarget;
 }
 
 async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
@@ -1579,8 +1814,15 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
     const rawTarget = String(args.target || '').trim();
     if (!rawTarget) throw new Error('MISSING_TARGET: target is required.');
     const urlObj = rawTarget.includes('://') ? new URL(rawTarget) : new URL(`https://${rawTarget}`);
+    if (!['https:', 'http:'].includes(urlObj.protocol) || urlObj.username || urlObj.password) {
+      throw new Error('FORBIDDEN_TARGET: Only http:// and https:// public targets without credentials are allowed.');
+    }
     if (isPrivateOrLoopbackHost(urlObj.hostname)) {
       throw new Error(`FORBIDDEN_TARGET: Refusing to probe private or loopback host "${urlObj.hostname}".`);
+    }
+    const lookedUp = await dns.lookup(urlObj.hostname, { all: true, verbatim: true }).catch(() => []);
+    if (!lookedUp.length || lookedUp.some((entry) => isBlockedIpAddress(entry.address))) {
+      throw new Error(`FORBIDDEN_TARGET: Host "${urlObj.hostname}" did not resolve to a public IP address.`);
     }
     const [v4, v6, localProxy] = await Promise.all([
       dns.resolve4(urlObj.hostname).catch(() => []),
@@ -1590,7 +1832,10 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
     const started = Date.now();
     let directProbe;
     try {
-      const resp = await fetch(urlObj.toString(), { signal: AbortSignal.timeout(5000) });
+      const resp = await fetch(urlObj.toString(), {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(5000),
+      });
       directProbe = { reachable: true, httpStatus: resp.status, latencyMs: Date.now() - started };
     } catch (e) {
       directProbe = { reachable: false, error: e?.message || String(e), latencyMs: Date.now() - started };
@@ -1652,10 +1897,13 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
     const qs = new URLSearchParams({ format: 'singbox', mode, region, port: String(port), raw: '1' });
     const res = await apiRequest({ baseUrl, method: 'GET', subPath: `/config?${qs.toString()}`, keyRecord });
     if (res.status >= 400) throw new Error(typeof res.data === 'string' ? res.data : JSON.stringify(res.data));
-    const text = typeof res.data === 'string' ? res.data : JSON.stringify(res.data, null, 2) + '\n';
+    const text = validateRemoteSingboxConfig(res.data, mode, port);
     if (args.outPath) {
-      const outPath = path.resolve(String(args.outPath));
+      const outPath = validateSafeConfigOutputPath(args.outPath, keyFile, { confineToAgentDirs: true });
       fs.writeFileSync(outPath, text, { encoding: 'utf8', mode: 0o600 });
+      try {
+        fs.chmodSync(outPath, 0o600);
+      } catch {}
       return {
         ok: true,
         outFile: outPath,
@@ -1670,7 +1918,7 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
       mode,
       region,
       ...(mode === 'proxy' ? { httpProxy: `http://127.0.0.1:${port}`, socks5Proxy: `socks5://127.0.0.1:${port}` } : {}),
-      singboxConfig: typeof res.data === 'string' ? JSON.parse(res.data) : res.data,
+      singboxConfig: JSON.parse(text),
     };
   }
 
@@ -1687,6 +1935,9 @@ async function executeHeadlessMcpTool(name, args = {}, { baseUrl, keyFile }) {
       if (res.status >= 400) throw new Error(JSON.stringify(res.data));
       const backupPath = `${keyFile}.prev`;
       fs.copyFileSync(keyFile, backupPath);
+      try {
+        fs.chmodSync(backupPath, 0o600);
+      } catch {}
       saveKeyRecord(keyFile, nextRecord);
       return { ...res.data, keyFile, backupKeyFile: backupPath };
     }
@@ -1893,7 +2144,8 @@ async function run() {
     return;
   }
 
-  const baseUrl = String(flags['api-base'] || DEFAULT_BASE_URL);
+  const allowCustomApiBase = Boolean(flags['allow-custom-api-base']);
+  const baseUrl = validateTrustedApiBase(String(flags['api-base'] || DEFAULT_BASE_URL), allowCustomApiBase);
   const keyFile = path.resolve(String(flags['key-file'] || DEFAULT_KEY_PATH));
 
   if (command === '__watchdog') {
@@ -1989,6 +2241,41 @@ async function run() {
     assert.equal(parseLoopbackProxyPort('10.0.0.1:8080'), null);
     const osProxyCheck = await inspectOsSystemProxyState(10808);
     assert.equal(typeof osProxyCheck.supported, 'boolean');
+
+    // Security self-tests: IP blocklist, API base trust boundary, remote sing-box config sanitizer, outPath confinement
+    assert.equal(isPrivateOrLoopbackHost('::ffff:127.0.0.1'), true);
+    assert.equal(isPrivateOrLoopbackHost('2130706433'), true);
+    assert.equal(isPrivateOrLoopbackHost('0x7f000001'), true);
+    assert.equal(isPrivateOrLoopbackHost('100.64.0.1'), true);
+    assert.equal(isPrivateOrLoopbackHost('1.1.1.1'), false);
+    assert.throws(() => validateTrustedApiBase('https://evil.example.com/api/v1/vpn', false), /UNTRUSTED_API_BASE/);
+    assert.equal(validateTrustedApiBase('https://yivpn.net/api/v1/vpn', false), 'https://yivpn.net/api/v1/vpn');
+    assert.throws(
+      () =>
+        validateRemoteSingboxConfig(
+          {
+            log: { output: '/etc/cron.d/pwn' },
+            inbounds: [{ type: 'mixed', listen: '127.0.0.1', listen_port: 10808 }],
+            outbounds: [{ type: 'vless', server: '57.180.66.66', server_port: 443 }],
+          },
+          'proxy',
+          10808
+        ),
+      /UNSAFE_REMOTE_CONFIG/
+    );
+    assert.throws(
+      () =>
+        validateRemoteSingboxConfig(
+          {
+            inbounds: [{ type: 'mixed', listen: '0.0.0.0', listen_port: 10808 }],
+            outbounds: [{ type: 'vless', server: '57.180.66.66', server_port: 443 }],
+          },
+          'proxy',
+          10808
+        ),
+      /UNSAFE_REMOTE_CONFIG/
+    );
+    assert.throws(() => validateSafeConfigOutputPath('/etc/pwn.conf', tmpKeyFile), /UNSAFE_OUTPUT_PATH/);
 
     const devHash = computeDeviceHash();
     if (devHash) {
@@ -2170,9 +2457,17 @@ async function run() {
       return;
     }
     if (flags.out) {
-      const outPath = path.resolve(String(flags.out));
-      const text = typeof res.data === 'string' ? res.data : JSON.stringify(res.data, null, 2) + '\n';
+      const outPath = validateSafeConfigOutputPath(flags.out, keyFile, { confineToAgentDirs: false });
+      const text =
+        format === 'singbox'
+          ? validateRemoteSingboxConfig(res.data, mode, port)
+          : typeof res.data === 'string'
+            ? res.data
+            : JSON.stringify(res.data, null, 2) + '\n';
       fs.writeFileSync(outPath, text, { encoding: 'utf8', mode: 0o600 });
+      try {
+        fs.chmodSync(outPath, 0o600);
+      } catch {}
       console.log(
         JSON.stringify(
           {
@@ -2213,6 +2508,9 @@ async function run() {
     }
     const backupPath = `${keyFile}.prev`;
     fs.copyFileSync(keyFile, backupPath);
+    try {
+      fs.chmodSync(backupPath, 0o600);
+    } catch {}
     saveKeyRecord(keyFile, nextRecord);
     console.log(JSON.stringify({ ...res.data, key_file: keyFile, backup_key_file: backupPath }, null, 2));
     return;
