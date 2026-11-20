@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "net.yivpn/yivpn-agent-cli",
+  "title": "YiVPN AI Agent VPN",
+  "description": "Dual-mode AI Agent VPN MCP server: smart split-tunneling, rootless proxy & 90m free trial.",
+  "websiteUrl": "https://yivpn.net/en/vpn-api/",
+  "repository": {
+    "url": "https://github.com/yivpn-official/yivpn-agent-cli",
+    "source": "github"
+  },
+  "version": "2.2.2",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/yivpn-official/yivpn-agent-cli/releases/download/v2.2.2/yivpn-agent-cli-v2.2.2.mcpb",
+      "version": "2.2.2",
+      "fileSha256": "f858dd2724847a08cde87fdbb0cdacf7dd14066bcfea8af0703ce30165a93e04",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
