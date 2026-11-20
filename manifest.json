@@ -1,0 +1,49 @@
+{
+  "manifest_version": "0.3",
+  "name": "yivpn-agent-cli",
+  "display_name": "YiVPN Agent CLI & MCP Server",
+  "version": "2.2.2",
+  "description": "Dual-mode VPN CLI & MCP server for AI agents with smart split-tunneling and free 90m/1GiB trial.",
+  "long_description": "Official zero-dependency Model Context Protocol (MCP) server and CLI for YiVPN. Bridges to the local YiVPN desktop client MCP for safe sing-box split-tunneling hot-reload and rollback, or automatically runs a rootless cloud VPN proxy (127.0.0.1:10808) with a zero-account 90-minute / 1 GiB free trial via ed25519-v1 API and x402 Base USDC.",
+  "author": {
+    "name": "YiVPN",
+    "email": "support@yivpn.net",
+    "url": "https://yivpn.net"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yivpn-official/yivpn-agent-cli"
+  },
+  "homepage": "https://yivpn.net/en/vpn-api/",
+  "documentation": "https://yivpn.net/vpn-api/llms.txt",
+  "license": "MIT",
+  "keywords": [
+    "vpn",
+    "mcp",
+    "ai-agent",
+    "proxy",
+    "sing-box",
+    "x402"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "bin/yivpn-agent.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/bin/yivpn-agent.mjs",
+        "mcp"
+      ]
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
+    "runtimes": {
+      "node": ">=20.0.0"
+    }
+  }
+}

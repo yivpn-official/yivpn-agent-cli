@@ -1,6 +1,6 @@
 {
   "name": "yivpn-agent-cli",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Unified YIVPN AI Agent CLI & Auto-Detecting MCP Server (v2.2.1) — Desktop App Bridge + Zero-Account Cloud API ($0 90m/1GiB Trial, ed25519-v1, x402) + Sing-Box 1.12+/1.14+ Proxy Daemon + Conflict-Safe OS System Proxy & Expiry Auto-Restore Watchdog.",
   "type": "module",
   "bin": {

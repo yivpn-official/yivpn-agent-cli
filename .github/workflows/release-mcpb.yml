@@ -1,0 +1,45 @@
+name: Release MCPB Bundle
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-mcpb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run self-test
+        run: npm test
+
+      - name: Build deterministic MCPB archive
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          BUNDLE="yivpn-agent-cli-${TAG_NAME}.mcpb"
+          zip -X -r "$BUNDLE" manifest.json package.json LICENSE README.md SKILL.md bin/yivpn-agent.mjs
+          sha256sum "$BUNDLE" > "${BUNDLE}.sha256"
+          cat "${BUNDLE}.sha256"
+          echo "BUNDLE=$BUNDLE" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "$BUNDLE" "${BUNDLE}.sha256" --clobber
+          else
+            gh release create "$TAG_NAME" "$BUNDLE" "${BUNDLE}.sha256" \
+              --title "YiVPN Agent CLI & MCP ${TAG_NAME}" \
+              --notes "Official zero-dependency YiVPN AI Agent CLI & MCP Server (${TAG_NAME}), including verified MCPB bundle for the Official MCP Registry."
+          fi
